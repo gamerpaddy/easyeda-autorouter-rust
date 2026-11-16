@@ -1,0 +1,17 @@
+[package]
+name = "viewer"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "autorouter"
+path = "src/main.rs"
+
+[dependencies]
+cli = { path = "../cli" }
+dsn = { path = "../dsn" }
+router = { path = "../router" }
+serde_json = "1"
+eframe = "0.37"
+serde = { version = "1", features = ["derive"] }
+rfd = "0.18"

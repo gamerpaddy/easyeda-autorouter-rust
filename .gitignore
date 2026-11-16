@@ -1,0 +1,18 @@
+# build output
+/target/
+/autorouter.exe
+
+# personal boards and routing results (EasyEDA/Specctra files)
+*.json
+*.ses
+*.dsn
+!/tests/*.dsn
+
+# local notes, benchmark scripts and logs
+*.log
+/.bench/
+/PERFORMANCE.md
+/tests/adau.ps1
+/crates/router/examples/escape.rs
+/scratch*/
+/docs/src/

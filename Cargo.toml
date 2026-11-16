@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["crates/dsn", "crates/router", "crates/viewer", "crates/cli"]
+
+[profile.release]
+opt-level = 3
+debug = false
+
+[profile.test]
+opt-level = 3

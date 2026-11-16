@@ -1,0 +1,13 @@
+[package]
+name = "cli"
+version = "0.1.0"
+edition = "2021"
+[[bin]]
+name = "autorouter-cli-dev"
+path = "src/main.rs"
+[dependencies]
+dsn = { path = "../dsn" }
+router = { path = "../router" }
+
+[dependencies.serde_json]
+version = "1"

@@ -1,0 +1,83 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+            bin: autorouter.exe
+          - os: ubuntu-22.04
+            name: linux-x64
+            bin: autorouter
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux packages
+        if: runner.os == 'Linux'
+        run: >
+          sudo apt-get update && sudo apt-get install -y
+          libxkbcommon-dev libwayland-dev libx11-dev libxi-dev libxcursor-dev
+          libxrandr-dev libgl1-mesa-dev libxcb-render0-dev libxcb-shape0-dev
+          libxcb-xfixes0-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --release -p dsn -p router --lib --test features --test sample -- --test-threads=1
+
+      - name: Build
+        run: cargo build --release -p viewer
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir dist
+          cp target/release/${{ matrix.bin }} dist/
+          cp README.md LICENSE dist/
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a ../autorouter-${{ matrix.name }}.zip .
+          else
+            tar czf ../autorouter-${{ matrix.name }}.tar.gz .
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: autorouter-${{ matrix.name }}
+          path: autorouter-${{ matrix.name }}.*
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: false
+          body: |
+            First release.
+
+            Open the EasyEDA source JSON of your project (File > Export > EasyEDA source), route, save, open the result in EasyEDA and press Ctrl+B to rebuild the copper areas. A DSN file is not supported, see the README.
+
+            - autorouter-windows-x64.zip: GUI and command line (`autorouter.exe -nogui board.json -o result.json`)
+            - autorouter-linux-x64.tar.gz: the same for Linux
