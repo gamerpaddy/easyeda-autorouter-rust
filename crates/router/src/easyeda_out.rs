@@ -13,6 +13,9 @@ pub struct JsonStats {
     pub tracks: usize,
     pub vias: usize,
     pub areas: usize,
+    /// tracks and vias that were on the board before routing and are left out of the saved file
+    /// (they are kept with `include_existing`)
+    pub omitted: usize,
 }
 
 fn n4(v: f64) -> String {
@@ -116,6 +119,15 @@ pub fn write_json(r: &Router, doc: &EasyedaDoc) -> (String, JsonStats) {
         stats.areas += 1;
     }
     if let Some(shapes) = root.get_mut("shape").and_then(|s| s.as_array_mut()) {
+        if !r.cfg.include_existing && !doc.existing.is_empty() {
+            let omit: std::collections::HashSet<usize> = doc.existing.iter().copied().collect();
+            let mut i = 0;
+            shapes.retain(|_| {
+                i += 1;
+                !omit.contains(&(i - 1))
+            });
+            stats.omitted = omit.len();
+        }
         shapes.extend(add.into_iter().map(Value::String));
     }
     (serde_json::to_string(&root).unwrap_or_default(), stats)
@@ -178,6 +190,8 @@ pub fn write_epro2(r: &Router, doc: &EasyedaDoc, pro: &ProDoc) -> Result<(Vec<u8
         add.push(NewObject::Pour { net: name.clone(), layer: lname.clone(), ring: ring.iter().map(|&p| doc.to_json_xy(p)).collect() });
         stats.areas += 1;
     }
-    let (bytes, _) = pro.save(&add, &r.part_moves)?;
+    let omit: &[usize] = if r.cfg.include_existing { &[] } else { &doc.existing };
+    stats.omitted = omit.len();
+    let (bytes, _) = pro.save(&add, &r.part_moves, omit)?;
     Ok((bytes, stats))
 }

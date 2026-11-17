@@ -1,6 +1,7 @@
 # build output
 /target/
 /autorouter.exe
+/autorouter.lnk
 
 # personal boards and routing results (EasyEDA/Specctra files)
 *.json

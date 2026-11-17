@@ -731,15 +731,29 @@ fn easyeda_pro_project_routes_and_round_trips() {
     assert!(report.clearance_violations.is_empty(), "{:?}", report.clearance_violations);
     assert!(report.open_nets.is_empty(), "{:?}", report.open_nets);
 
+    // default: the saved file holds the new routing only, the 6 existing tracks and 6 vias are left out
+    assert!(!r.cfg.include_existing);
     let (out, st) = router::easyeda_out::write_output(&r, &doc).unwrap();
     assert!(st.tracks > 100 && st.vias > 10, "{st:?}");
+    assert_eq!(st.omitted, board.wires.len() + board.vias.len());
     let again = dsn::easyeda_pro::load(&out).unwrap();
     let b2 = dsn::parse_dsn(&again.dsn).unwrap();
-    // everything of the original project is still there, plus the new tracks and vias
-    assert_eq!(b2.wires.len(), board.wires.len() + st.tracks);
-    assert_eq!(b2.vias.len(), board.vias.len() + st.vias);
+    assert_eq!(b2.wires.len(), st.tracks);
+    assert_eq!(b2.vias.len(), st.vias);
     assert_eq!(b2.abs_pins().len(), board.abs_pins().len());
     assert_eq!(b2.nets.len(), board.nets.len());
+    // and the rest of the project (parts, outline, regions) is untouched
+    assert_eq!(b2.planes.len(), board.planes.len() + st.areas); // the project's own areas plus the new pours
+    assert_eq!(b2.keepouts.len(), board.keepouts.len());
+
+    // include_existing: everything of the original project stays, plus the new tracks and vias
+    r.cfg.include_existing = true;
+    let (kept, st2) = router::easyeda_out::write_output(&r, &doc).unwrap();
+    assert_eq!(st2.omitted, 0);
+    let b3 = dsn::parse_dsn(&dsn::easyeda_pro::load(&kept).unwrap().dsn).unwrap();
+    assert_eq!(b3.wires.len(), board.wires.len() + st.tracks);
+    assert_eq!(b3.vias.len(), board.vias.len() + st.vias);
+    r.cfg.include_existing = false;
 
     // the slot region (x 420..560 mil, y 715..860 mil) stays free of new copper
     let zip_text = {
@@ -770,4 +784,41 @@ fn easyeda_pro_project_routes_and_round_trips() {
             assert!(!in_slot(x, y), "new copper inside the slot at {x},{y}: {l}");
         }
     }
+}
+
+/// Existing tracks and vias of an EasyEDA Standard JSON are left out of the saved file unless
+/// `include_existing` is set; everything else in the document is always kept.
+#[test]
+fn existing_tracks_and_vias_are_only_saved_when_asked_for() {
+    let json = r#"{"head":{"docType":"3"},"layers":[],
+      "DRCRULE":{"Default":{"trackWidth":1,"clearance":0.6,"viaHoleDiameter":2.4}},
+      "shape":["TRACK~1~10~~100 100 220 100 220 160 100 160 100 100~gge1~0",
+               "PAD~ELLIPSE~110~110~4~4~11~A~1~1~~0~gge2~0~~Y~0~0~0.2~110,110",
+               "PAD~ELLIPSE~205~150~4~4~11~A~2~1~~0~gge3~0~~Y~0~0~0.2~205,150",
+               "TRACK~1~1~B~130 135 150 135~gge4~0",
+               "VIA~160~135~2.4~B~0.6~gge5~0",
+               "TRACK~0.5~3~~105 105 115 105~gge6~0"]}"#;
+    let doc = dsn::easyeda::load(json).unwrap();
+    // the copper track and the via, not the outline and not the silkscreen track
+    assert_eq!(doc.existing, vec![3, 4]);
+    let board = dsn::parse_dsn(&doc.dsn).unwrap();
+    let mut cfg = Config { verbose: false, unit_mm: Some(0.254), keep_track_widths: true, ..Config::default() };
+    cfg.use_trace_routing();
+    let mut r = Router::new(&board, cfg);
+    r.route_all();
+    r.finish();
+    let shapes = |text: &str| -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(text).unwrap();
+        v["shape"].as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_string()).collect()
+    };
+    let (out, st) = router::easyeda_out::write_json(&r, &doc);
+    let s = shapes(&out);
+    assert_eq!(st.omitted, 2);
+    assert!(!s.iter().any(|t| t.starts_with("TRACK~1~1~B~") || t.starts_with("VIA~160~135")), "{s:?}");
+    assert!(s[0].starts_with("TRACK~1~10~") && s[1].starts_with("PAD~") && s[3].starts_with("TRACK~0.5~3~"), "{s:?}");
+    r.cfg.include_existing = true;
+    let (out, st) = router::easyeda_out::write_json(&r, &doc);
+    let s = shapes(&out);
+    assert_eq!(st.omitted, 0);
+    assert!(s[3].starts_with("TRACK~1~1~B~") && s[4].starts_with("VIA~160~135"), "{s:?}");
 }

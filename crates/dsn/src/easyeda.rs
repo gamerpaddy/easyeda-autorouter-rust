@@ -30,8 +30,12 @@ pub struct EasyedaDoc {
     pub areas: HashSet<(String, String)>,
     /// every object id in the document (new ids must not collide)
     pub ids: HashSet<String>,
-    /// set when the document is an EasyEDA Pro project (`.epro2`); `root` is empty then
+    /// set when the document is an EasyEDA Pro project (`.epro2` / `.epro`); `root` is empty then
     pub pro: Option<crate::easyeda_pro::ProDoc>,
+    /// The tracks and vias that were already on the board, as the writer finds them: indices into
+    /// the `shape` list (Standard JSON) or line numbers of the PCB (Pro). Footprint contents are
+    /// not listed.
+    pub existing: Vec<usize>,
 }
 
 impl EasyedaDoc {
@@ -592,6 +596,7 @@ pub fn load(text: &str) -> Result<EasyedaDoc, String> {
     let mut areas: HashSet<(String, String)> = HashSet::new();
     let mut ids: HashSet<String> = HashSet::new();
     let mut other_outline = 0;
+    let mut existing: Vec<usize> = vec![];
 
     for (si, s) in shapes.iter().enumerate() {
         let pads_before = pads.len();
@@ -631,9 +636,15 @@ pub fn load(text: &str) -> Result<EasyedaDoc, String> {
                         if in_lib {
                             counts[5] += 1;
                         }
+                        if top {
+                            existing.push(shape_list[si].0);
+                        }
                     }
                 }
                 "VIA" if loose => {
+                    if top {
+                        existing.push(shape_list[si].0);
+                    }
                     vias.push((f(t.get(1)), f(t.get(2)), f(t.get(3)), t.get(4).unwrap_or(&"").to_string()));
                     if in_lib {
                         counts[0] += 1;
@@ -778,7 +789,7 @@ pub fn load(text: &str) -> Result<EasyedaDoc, String> {
     finish(
         Collected {
             notes, pads, holes, outline, tracks, vias, strokes, regions, counts, copper, areas, ids, other_outline,
-            track_w, clear, via_d, special,
+            track_w, clear, via_d, special, existing,
         },
         root,
         parts_info,
@@ -815,6 +826,8 @@ pub(crate) struct Collected {
     pub via_d: f64,
     /// net class overrides: net, width, clearance (margin included)
     pub special: Vec<(String, f64, f64)>,
+    /// see `EasyedaDoc::existing`
+    pub existing: Vec<usize>,
 }
 
 pub(crate) fn finish(
@@ -825,7 +838,7 @@ pub(crate) fn finish(
 ) -> Result<EasyedaDoc, String> {
     let Collected {
         mut notes, pads, holes, outline, tracks, vias, strokes, regions, counts, copper, areas, ids, other_outline,
-        track_w, clear, via_d, special,
+        track_w, clear, via_d, special, existing,
     } = c;
 
     if other_outline > 0 {
@@ -1095,7 +1108,7 @@ pub(crate) fn finish(
     if !areas.is_empty() {
         notes.push(format!("{} existing copper area(s) are kept; nets and layers that already have one get no new fill", areas.len()));
     }
-    Ok(EasyedaDoc { root, parts: parts_info, dsn: o, ox, oy, notes, areas, ids, pro })
+    Ok(EasyedaDoc { root, parts: parts_info, dsn: o, ox, oy, notes, areas, ids, pro, existing })
 }
 
 #[cfg(test)]

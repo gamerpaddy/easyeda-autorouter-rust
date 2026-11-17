@@ -35,13 +35,16 @@ fn st(p: Pt) -> Pt {
 pub struct ProDoc {
     /// the project file as it was read (a ZIP archive)
     bytes: Vec<u8>,
-    /// name of the `.epru` entry inside it
+    /// the archive entry that holds the PCB: the `.epru` of an `.epro2`, `PCB/<uuid>.epcb` of an `.epro`
     epru_name: String,
-    /// every line of the `.epru`
+    /// every line of that entry
     lines: Vec<String>,
     /// new objects are inserted at this line index (end of the PCB document)
     insert_at: usize,
     max_ticket: u64,
+    /// the older `.epro` layout (positional records, ids `e<number>`, no tickets)
+    legacy: bool,
+    next_eid: u64,
     ids: HashSet<String>,
     pour_n: usize,
     pour_order: i64,
@@ -307,32 +310,213 @@ fn bbox_area(v: &[Pt]) -> f64 {
 /// Name and text of the `.epru` entry of an `.epro2` archive.
 fn read_epru(bytes: &[u8]) -> Result<(String, String), String> {
     let mut z = zip::ZipArchive::new(Cursor::new(bytes))
-        .map_err(|e| format!("not an EasyEDA Pro project (.epro2 is a ZIP archive): {e}"))?;
+        .map_err(|e| format!("not an EasyEDA Pro project (.epro2 and .epro are ZIP archives): {e}"))?;
     let names: Vec<String> = z.file_names().filter_map(|n| n.ok()).map(|n| n.to_string()).collect();
     let name = names
         .iter()
         .find(|n| n.to_lowercase().ends_with(".epru"))
         .ok_or("the project archive has no .epru entry")?
         .clone();
+    Ok((name.clone(), read_entry(&mut z, &name)?))
+}
+
+fn read_entry(z: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> Result<String, String> {
     let mut text = String::new();
-    z.by_name(&name)
+    z.by_name(name)
         .map_err(|e| e.to_string())?
         .read_to_string(&mut text)
         .map_err(|e| format!("cannot read {name}: {e}"))?;
-    Ok((name, text))
+    Ok(text)
 }
 
+/// A project as the loader needs it, whatever the file layout.
+struct Project {
+    /// records of the PCB document
+    recs: Vec<Rec>,
+    /// records of every footprint, by uuid
+    fps: HashMap<String, Vec<Rec>>,
+    /// archive entry that holds the PCB, and its lines
+    entry: String,
+    lines: Vec<String>,
+    /// new objects go in at this line
+    insert_at: usize,
+    /// highest ticket (.epro2) or object number (.epro)
+    seed: u64,
+    legacy: bool,
+    notes: Vec<String>,
+}
+
+/// Load an EasyEDA Pro project: `.epro2` (one `.epru` text with all documents) or the older
+/// `.epro` (one file per document, every record a positional JSON array).
 pub fn load(bytes: &[u8]) -> Result<EasyedaDoc, String> {
-    let (name, text) = read_epru(bytes)?;
-    let title = zip::ZipArchive::new(Cursor::new(bytes))
-        .ok()
-        .and_then(|mut z| {
-            let mut t = String::new();
-            z.by_name("project2.json").ok()?.read_to_string(&mut t).ok()?;
-            serde_json::from_str::<Value>(&t).ok()?.get("title")?.as_str().map(|s| s.to_string())
+    let mut z = zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|e| format!("not an EasyEDA Pro project (.epro2 and .epro are ZIP archives): {e}"))?;
+    let names: Vec<String> = z.file_names().filter_map(|n| n.ok()).map(|n| n.to_string()).collect();
+    let has = |ext: &str| names.iter().any(|n| n.to_lowercase().ends_with(ext));
+    let json_field = |z: &mut zip::ZipArchive<Cursor<&[u8]>>, entry: &str, f: &dyn Fn(&Value) -> Option<String>| {
+        read_entry(z, entry).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| f(&v)).unwrap_or_default()
+    };
+    if has(".epru") {
+        let (name, text) = read_epru(bytes)?;
+        let title = json_field(&mut z, "project2.json", &|v| v.get("title")?.as_str().map(|s| s.to_string()));
+        build(bytes.to_vec(), project_epro2(name, &text)?, title)
+    } else if has(".epcb") {
+        let title = json_field(&mut z, "project.json", &|v| v.pointer("/config/title")?.as_str().map(|s| s.to_string()));
+        let p = project_epro1(&mut z, &names)?;
+        build(bytes.to_vec(), p, title)
+    } else {
+        Err("not an EasyEDA Pro project: the archive has neither a .epru nor a .epcb entry".into())
+    }
+}
+
+fn project_epro2(entry: String, text: &str) -> Result<Project, String> {
+    let lines: Vec<String> = text.split('\n').map(|l| l.to_string()).collect();
+    // ---- split into documents
+    let mut spans: Vec<DocSpan> = vec![];
+    let mut max_ticket = 0u64;
+    for (i, l) in lines.iter().enumerate() {
+        let Some((h, b)) = split_line(l) else { continue };
+        let Ok(head) = serde_json::from_str::<Value>(h) else { continue };
+        for k in ["ticket", "firstTicket"] {
+            max_ticket = max_ticket.max(head.get(k).and_then(|v| v.as_u64()).unwrap_or(0));
+        }
+        if head.get("type").and_then(|t| t.as_str()) == Some("DOCHEAD") {
+            if let Some(last) = spans.last_mut() {
+                last.end = i;
+            }
+            let body = serde_json::from_str::<Value>(b).unwrap_or(Value::Null);
+            spans.push(DocSpan { start: i, end: lines.len(), doc_type: s(&body, "docType").into(), uuid: s(&body, "uuid").into() });
+        }
+    }
+    if spans.is_empty() {
+        return Err("not an EasyEDA Pro project: the .epru entry has no documents".into());
+    }
+    // ---- the PCB: the one with the most components
+    let pcbs: Vec<usize> = (0..spans.len()).filter(|&i| spans[i].doc_type == "PCB").collect();
+    if pcbs.is_empty() {
+        return Err("the project has no PCB document".into());
+    }
+    let mut best = (0usize, 0usize);
+    for &i in &pcbs {
+        let n = lines[spans[i].start..spans[i].end].iter().filter(|l| l.starts_with("{\"type\":\"COMPONENT\"")).count();
+        if n >= best.1 {
+            best = (i, n);
+        }
+    }
+    let pcb = &spans[best.0];
+    let recs = parse_records(&lines, pcb);
+    let mut notes: Vec<String> = vec![];
+    if pcbs.len() > 1 {
+        let name = recs.iter().find(|r| r.ty == "META").map(|r| s(&r.body, "title").to_string()).unwrap_or_default();
+        notes.push(format!("the project has {} PCBs; \"{name}\" (the one with the most parts) is used", pcbs.len()));
+    }
+    let fps = spans.iter().filter(|d| d.doc_type == "FOOTPRINT").map(|d| (d.uuid.clone(), parse_records(&lines, d))).collect();
+    let mut insert_at = pcb.end;
+    while insert_at > pcb.start + 1 && lines[insert_at - 1].trim().is_empty() {
+        insert_at -= 1;
+    }
+    Ok(Project { recs, fps, entry, lines, insert_at, seed: max_ticket, legacy: false, notes })
+}
+
+fn legacy_lines(text: &str) -> Vec<String> {
+    text.split('\n').map(|l| l.to_string()).collect()
+}
+
+fn legacy_records(lines: &[String]) -> Vec<Rec> {
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| {
+            let a: Vec<Value> = serde_json::from_str(l.trim()).ok()?;
+            legacy_rec(&a, i)
         })
-        .unwrap_or_default();
-    load_text(bytes.to_vec(), name, &text, title)
+        .collect()
+}
+
+fn project_epro1(z: &mut zip::ZipArchive<Cursor<&[u8]>>, names: &[String]) -> Result<Project, String> {
+    let ends = |n: &str, e: &str| n.to_lowercase().ends_with(e);
+    // ---- the PCB: the one with the most components
+    let mut best: Option<(String, Vec<String>, usize)> = None;
+    let pcb_names: Vec<&String> = names.iter().filter(|n| ends(n, ".epcb")).collect();
+    for n in &pcb_names {
+        let lines = legacy_lines(&read_entry(z, n)?);
+        let c = lines.iter().filter(|l| l.starts_with("[\"COMPONENT\"")).count();
+        if best.as_ref().is_none_or(|b| c > b.2) {
+            best = Some(((*n).clone(), lines, c));
+        }
+    }
+    let (entry, lines, _) = best.ok_or("the project has no PCB document")?;
+    let recs = legacy_records(&lines);
+    let mut notes = vec![];
+    if pcb_names.len() > 1 {
+        notes.push(format!("the project has {} PCBs; the one with the most parts is used", pcb_names.len()));
+    }
+    // ---- footprints: FOOTPRINT/<uuid>.efoo
+    let mut fps: HashMap<String, Vec<Rec>> = HashMap::new();
+    for n in names.iter().filter(|n| ends(n, ".efoo")) {
+        let uuid = n.rsplit('/').next().unwrap_or(n).trim_end_matches(".efoo").to_string();
+        fps.insert(uuid, legacy_records(&legacy_lines(&read_entry(z, n)?)));
+    }
+    let mut insert_at = lines.len();
+    while insert_at > 1 && lines[insert_at - 1].trim().is_empty() {
+        insert_at -= 1;
+    }
+    Ok(Project { recs, fps, entry, lines, insert_at, seed: 0, legacy: true, notes })
+}
+
+/// A record of the older `.epro` layout (`["TYPE", id, ...]`, fields by position) as the body
+/// the newer layout uses (named fields), so both are read by the same code.
+fn legacy_rec(a: &[Value], line: usize) -> Option<Rec> {
+    let ty = a.first()?.as_str()?;
+    let g = |i: usize| a.get(i).cloned().unwrap_or(Value::Null);
+    let id = a.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let flag = |i: usize| a.get(i).is_some_and(|v| v.as_bool().unwrap_or_else(|| v.as_f64().unwrap_or(0.0) != 0.0));
+    let mk = |ty: &str, id: String, body: Value| Some(Rec { ty: ty.into(), id, line, body });
+    match ty {
+        "LINE" => mk(ty, id, json!({"netName":g(3),"layerId":g(4),"startX":g(5),"startY":g(6),"endX":g(7),"endY":g(8),"width":g(9)})),
+        "VIA" => mk(ty, id, json!({"netName":g(3),"centerX":g(5),"centerY":g(6),"holeDiameter":g(7),"viaDiameter":g(8)})),
+        "PAD" => {
+            // "no hole" is a round hole of size 0
+            let hole = a
+                .get(9)
+                .and_then(|h| h.as_array())
+                .filter(|h| h.len() >= 3 && (h[1].as_f64().unwrap_or(0.0) > 0.0 || h[2].as_f64().unwrap_or(0.0) > 0.0))
+                .map(|h| json!({"holeType":h[0],"width":h[1],"height":h[2]}));
+            let pad = a
+                .get(10)
+                .and_then(|p| p.as_array())
+                .filter(|p| p.len() >= 3)
+                .map(|p| json!({"padType":p[0],"width":p[1],"height":p[2],"radius":p.get(3).cloned().unwrap_or(json!(0))}));
+            mk(
+                ty,
+                id,
+                json!({"netName":g(3),"layerId":g(4),"num":g(5),"centerX":g(6),"centerY":g(7),"padAngle":g(8),"hole":hole,
+                    "defaultPad":pad,"padOffsetX":g(12),"padOffsetY":g(13),"relativeAngle":g(14),"plated":flag(15)}),
+            )
+        }
+        "FILL" => mk(ty, id, json!({"netName":g(3),"layerId":g(4),"width":g(5),"path":g(7)})),
+        "POLY" => mk(ty, id, json!({"netName":g(3),"layerId":g(4),"width":g(5),"path":g(6)})),
+        "POUR" => mk(ty, id, json!({"netName":g(3),"layerId":g(4),"name":g(6),"order":g(7),"path":g(8)})),
+        "COMPONENT" => mk(ty, id, json!({"layerId":g(3),"x":g(4),"y":g(5),"angle":g(6)})),
+        "ATTR" => mk(ty, id, json!({"parentId":g(3),"x":g(5),"y":g(6),"key":g(7),"value":g(8)})),
+        // [PAD_NET, component, pad number, net, pad id, length]
+        "PAD_NET" => mk(ty, json!(["PAD_NET", g(1), g(2), g(4)]).to_string(), json!({"padNet":g(3)})),
+        "LAYER" => mk(ty, json!(["LAYER", g(1)]).to_string(), json!({"use":flag(4)})),
+        "RULE" => {
+            let (kind, ctx) = match a.get(1).and_then(|k| k.as_str())? {
+                "1" => ("SAFE", json!({"safeSpacing":[{"content":a.get(4).and_then(|c| c.get(1)).cloned().unwrap_or(Value::Null)}]})),
+                "3" => ("TRACK", json!({"track":{"content":[{"stroDef":a.get(4).and_then(|c| c.get(2)).cloned().unwrap_or(Value::Null)}]}})),
+                "5" => ("RADIUS", g(4)),
+                _ => return None,
+            };
+            let state = if flag(3) { json!("DEFAULT") } else { json!(0) };
+            mk(ty, json!(["RULE", kind, g(2)]).to_string(), json!({"ruleState":state,"ruleContext":ctx}))
+        }
+        "HEAD" => mk("META", String::new(), json!({"title":a.get(1).and_then(|h| h.get("title")).cloned().unwrap_or(Value::Null)})),
+        // geometry this reader does not know the layout of: reported, not guessed
+        t if GEOMETRY.contains(&t) => mk("UNKNOWN", id, json!({"type":t})),
+        _ => None,
+    }
 }
 
 #[derive(Default)]
@@ -626,48 +810,8 @@ fn rules(recs: &[Rec]) -> (f64, f64, f64, f64) {
     (track, clear, via, hole)
 }
 
-pub(crate) fn load_text(bytes: Vec<u8>, epru_name: String, text: &str, title: String) -> Result<EasyedaDoc, String> {
-    let lines: Vec<String> = text.split('\n').map(|l| l.to_string()).collect();
-    // ---- split into documents
-    let mut spans: Vec<DocSpan> = vec![];
-    let mut max_ticket = 0u64;
-    for (i, l) in lines.iter().enumerate() {
-        let Some((h, b)) = split_line(l) else { continue };
-        let Ok(head) = serde_json::from_str::<Value>(h) else { continue };
-        for k in ["ticket", "firstTicket"] {
-            max_ticket = max_ticket.max(head.get(k).and_then(|v| v.as_u64()).unwrap_or(0));
-        }
-        if head.get("type").and_then(|t| t.as_str()) == Some("DOCHEAD") {
-            if let Some(last) = spans.last_mut() {
-                last.end = i;
-            }
-            let body = serde_json::from_str::<Value>(b).unwrap_or(Value::Null);
-            spans.push(DocSpan { start: i, end: lines.len(), doc_type: s(&body, "docType").into(), uuid: s(&body, "uuid").into() });
-        }
-    }
-    if spans.is_empty() {
-        return Err("not an EasyEDA Pro project: the .epru entry has no documents".into());
-    }
-    // ---- the PCB: the one with the most components
-    let pcbs: Vec<usize> = (0..spans.len()).filter(|&i| spans[i].doc_type == "PCB").collect();
-    if pcbs.is_empty() {
-        return Err("the project has no PCB document".into());
-    }
-    let mut best = (0usize, 0usize);
-    for &i in &pcbs {
-        let n = lines[spans[i].start..spans[i].end].iter().filter(|l| l.starts_with("{\"type\":\"COMPONENT\"")).count();
-        if n >= best.1 {
-            best = (i, n);
-        }
-    }
-    let pcb = &spans[best.0];
-    let recs = parse_records(&lines, pcb);
-    let mut notes: Vec<String> = vec![];
-    if pcbs.len() > 1 {
-        let name = recs.iter().find(|r| r.ty == "META").map(|r| s(&r.body, "title").to_string()).unwrap_or_default();
-        notes.push(format!("the project has {} PCBs; \"{name}\" (the one with the most parts) is used", pcbs.len()));
-    }
-
+fn build(bytes: Vec<u8>, p: Project, title: String) -> Result<EasyedaDoc, String> {
+    let Project { recs, fps, lines, entry, insert_at, seed, legacy, mut notes } = p;
     let mut acc = Acc::default();
     // ---- copper layers: top, bottom, then the enabled inner layers
     acc.copper = vec![(1, "1".into()), (2, "2".into())];
@@ -682,9 +826,6 @@ pub(crate) fn load_text(bytes: Vec<u8>, epru_name: String, text: &str, title: St
     for id in inner {
         acc.copper.push((id, layer_name(id)));
     }
-
-    // ---- footprints by uuid
-    let fp_span: HashMap<&str, &DocSpan> = spans.iter().filter(|d| d.doc_type == "FOOTPRINT").map(|d| (d.uuid.as_str(), d)).collect();
 
     // pad nets: (component id, pad element id) -> net
     let mut pad_net: HashMap<(String, String), String> = HashMap::new();
@@ -709,7 +850,7 @@ pub(crate) fn load_text(bytes: Vec<u8>, epru_name: String, text: &str, title: St
     for comp in recs.iter().filter(|r| r.ty == "COMPONENT") {
         let uuid = attr.get(&(comp.id.as_str(), "Footprint")).map(|a| s(a.0, "value")).unwrap_or("");
         let des = attr.get(&(comp.id.as_str(), "Designator")).map(|a| s(a.0, "value").to_string()).unwrap_or_default();
-        let Some(fp) = fp_span.get(uuid) else {
+        let Some(frecs) = fps.get(uuid) else {
             if !uuid.is_empty() || !des.is_empty() {
                 missing.push(if des.is_empty() { comp.id.clone() } else { des });
             }
@@ -719,10 +860,9 @@ pub(crate) fn load_text(bytes: Vec<u8>, epru_name: String, text: &str, title: St
         if xf.bottom {
             bottom += 1;
         }
-        let frecs = parse_records(&lines, fp);
         let before = acc.pads.len();
         let mut smd = true;
-        for r in &frecs {
+        for r in frecs.iter() {
             if r.ty == "PAD" {
                 let net = pad_net.get(&(comp.id.clone(), r.id.clone())).cloned().unwrap_or_default();
                 if present(&r.body, "hole").is_some() || int(&r.body, "layerId") == 12 {
@@ -760,7 +900,16 @@ pub(crate) fn load_text(bytes: Vec<u8>, epru_name: String, text: &str, title: St
     }
 
     // ---- loose objects of the board
+    let mut existing: Vec<usize> = vec![];
     for r in &recs {
+        // tracks and vias that are on the board already
+        if match r.ty.as_str() {
+            "VIA" => true,
+            "LINE" | "ARC" => acc.layer(int(&r.body, "layerId")).is_some(),
+            _ => false,
+        } {
+            existing.push(r.line);
+        }
         match r.ty.as_str() {
             "PAD" => {
                 acc.pad(&r.body, &Xf::ID, s(&r.body, "netName"));
@@ -768,6 +917,10 @@ pub(crate) fn load_text(bytes: Vec<u8>, epru_name: String, text: &str, title: St
             t if GEOMETRY.contains(&t) => acc.object(&r.ty, &r.body, &Xf::ID, false),
             _ => {}
         }
+    }
+
+    for r in recs.iter().chain(fps.values().flatten()).filter(|r| r.ty == "UNKNOWN") {
+        *acc.unknown.entry(s(&r.body, "type").to_string()).or_default() += 1;
     }
 
     // ---- board outline: the biggest closed contour; the others are cut-outs
@@ -806,16 +959,15 @@ pub(crate) fn load_text(bytes: Vec<u8>, epru_name: String, text: &str, title: St
         pour_n = pour_n.max(s(&r.body, "name").trim_start_matches("POUR").parse().unwrap_or(0));
         pour_order = pour_order.max(int(&r.body, "order"));
     }
-    let mut insert_at = pcb.end;
-    while insert_at > pcb.start + 1 && lines[insert_at - 1].trim().is_empty() {
-        insert_at -= 1;
-    }
+    let next_eid = ids.iter().filter_map(|i| i.strip_prefix('e')?.parse::<u64>().ok()).max().unwrap_or(0) + 1;
     let pro = ProDoc {
         bytes,
-        epru_name,
+        epru_name: entry,
         lines,
         insert_at,
-        max_ticket,
+        max_ticket: seed,
+        legacy,
+        next_eid,
         ids: ids.clone(),
         pour_n,
         pour_order,
@@ -826,7 +978,8 @@ pub(crate) fn load_text(bytes: Vec<u8>, epru_name: String, text: &str, title: St
     notes.insert(
         0,
         format!(
-            "EasyEDA Pro PCB with {} copper layer(s), {} part(s), {} pad(s)",
+            "EasyEDA Pro {} PCB with {} copper layer(s), {} part(s), {} pad(s)",
+            if legacy { "(.epro)" } else { "(.epro2)" },
             acc.copper.len(),
             parts.len(),
             acc.pads.len()
@@ -852,6 +1005,7 @@ pub(crate) fn load_text(bytes: Vec<u8>, epru_name: String, text: &str, title: St
             clear: clear * PX + CLEARANCE_MARGIN,
             via_d: via * PX,
             special: vec![],
+            existing,
         },
         Value::Null,
         parts,
@@ -886,56 +1040,107 @@ fn shift_record(line: &str, dx: f64, dy: f64) -> Option<String> {
     Some(format!("{h}||{}|{cr}", serde_json::to_string(&body).ok()?))
 }
 
+/// Move the x/y of a record of the older `.epro` layout by (dx, dy) mil: components keep them at
+/// fields 4 and 5, attributes (labels) at 5 and 6.
+fn shift_legacy(line: &str, dx: f64, dy: f64) -> Option<String> {
+    let mut a: Vec<Value> = serde_json::from_str(line.trim()).ok()?;
+    let (ix, iy) = match a.first()?.as_str()? {
+        "COMPONENT" => (4, 5),
+        "ATTR" => (5, 6),
+        _ => return None,
+    };
+    let (x, y) = (a.get(ix)?.as_f64()?, a.get(iy)?.as_f64()?);
+    a[ix] = json!(r4(x + dx));
+    a[iy] = json!(r4(y + dy));
+    let cr = if line.ends_with('\r') { "\r" } else { "" };
+    Some(format!("{}{cr}", serde_json::to_string(&a).ok()?))
+}
+
+/// New records, in the layout of the project they go into.
+struct Writer<'a> {
+    doc: &'a ProDoc,
+    ticket: u64,
+    eid: u64,
+    used: HashSet<String>,
+    counter: u64,
+    lines: Vec<String>,
+}
+
+impl Writer<'_> {
+    fn id(&mut self) -> String {
+        if self.doc.legacy {
+            self.eid += 1;
+            return format!("e{}", self.eid - 1);
+        }
+        loop {
+            self.counter += 1;
+            let id = format!("{:016x}", mix(self.doc.max_ticket.wrapping_mul(0x1_0000_0001) ^ self.counter));
+            if self.used.insert(id.clone()) {
+                return id;
+            }
+        }
+    }
+
+    /// `body` is the object of the `.epro2` layout, `fields` the positional fields that follow
+    /// the id in the `.epro` layout.
+    fn push(&mut self, ty: &str, body: Value, fields: Vec<Value>) {
+        let id = self.id();
+        if self.doc.legacy {
+            let mut a = vec![json!(ty), json!(id)];
+            a.extend(fields);
+            self.lines.push(Value::Array(a).to_string());
+        } else {
+            self.ticket += 1;
+            self.lines.push(format!("{{\"type\":\"{ty}\",\"ticket\":{},\"id\":\"{id}\"}}||{body}|", self.ticket));
+        }
+    }
+}
+
 impl ProDoc {
     /// The project with `add` appended to the PCB and the parts moved by `moves` (part index,
-    /// dx, dy) in router units, y up. Returns the new `.epro2` and the number of objects added.
-    pub fn save(&self, add: &[NewObject], moves: &[(usize, f64, f64)]) -> Result<(Vec<u8>, usize), String> {
+    /// dx, dy) in router units, y up. The records at the line numbers `omit` (see
+    /// `EasyedaDoc::existing`) are left out. Returns the new project file and the number of
+    /// objects added.
+    pub fn save(&self, add: &[NewObject], moves: &[(usize, f64, f64)], omit: &[usize]) -> Result<(Vec<u8>, usize), String> {
         let mut lines = self.lines.clone();
         for &(pi, dx, dy) in moves {
             let Some(p) = self.parts.get(pi) else { continue };
             for &li in std::iter::once(&p.comp).chain(p.attrs.iter()) {
-                if let Some(n) = shift_record(&lines[li], dx / PX, dy / PX) {
+                let moved = if self.legacy { shift_legacy(&lines[li], dx / PX, dy / PX) } else { shift_record(&lines[li], dx / PX, dy / PX) };
+                if let Some(n) = moved {
                     lines[li] = n;
                 }
             }
         }
-        let mut ticket = self.max_ticket;
-        let mut used = self.ids.clone();
-        let mut counter = 0u64;
-        let mut new_id = || loop {
-            counter += 1;
-            let id = format!("{:016x}", mix(self.max_ticket.wrapping_mul(0x1_0000_0001) ^ counter));
-            if used.insert(id.clone()) {
-                return id;
-            }
-        };
+        let mut w = Writer { doc: self, ticket: self.max_ticket, eid: self.next_eid, used: self.ids.clone(), counter: 0, lines: vec![] };
         let (mut pour_n, mut order) = (self.pour_n, self.pour_order);
-        let mut out: Vec<String> = vec![];
-        let mut rec = |ty: &str, body: Value, id: String, out: &mut Vec<String>| {
-            ticket += 1;
-            out.push(format!("{{\"type\":\"{ty}\",\"ticket\":{ticket},\"id\":\"{id}\"}}||{}|", serde_json::to_string(&body).unwrap_or_default()));
-        };
         let mil = |p: Pt| (r4(p.0 / PX), r4(-p.1 / PX));
         for o in add {
             match o {
                 NewObject::Track { net, layer, width, pts } => {
                     let Some(lid) = layer_id(layer) else { continue };
-                    for w in pts.windows(2) {
-                        if (w[0].0 - w[1].0).abs() < 1e-9 && (w[0].1 - w[1].1).abs() < 1e-9 {
+                    for seg in pts.windows(2) {
+                        if (seg[0].0 - seg[1].0).abs() < 1e-9 && (seg[0].1 - seg[1].1).abs() < 1e-9 {
                             continue;
                         }
-                        let (a, e) = (mil(w[0]), mil(w[1]));
+                        let (a, e) = (mil(seg[0]), mil(seg[1]));
+                        let wd = r4(width / PX);
                         let body = json!({"partitionId":"","groupId":0,"netName":net,"layerId":lid,
-                            "startX":a.0,"startY":a.1,"endX":e.0,"endY":e.1,"width":r4(width / PX),"locked":false,"zIndex":-1});
-                        rec("LINE", body, new_id(), &mut out);
+                            "startX":a.0,"startY":a.1,"endX":e.0,"endY":e.1,"width":wd,"locked":false,"zIndex":-1});
+                        w.push("LINE", body, vec![json!(0), json!(net), json!(lid), json!(a.0), json!(a.1), json!(e.0), json!(e.1), json!(wd), json!(0)]);
                     }
                 }
                 NewObject::Via { net, at, dia, hole } => {
                     let c = mil(*at);
+                    let (hd, vd) = (r4(hole / PX), r4(dia / PX));
                     let body = json!({"partitionId":"","groupId":0,"netName":net,"ruleName":"","centerX":c.0,"centerY":c.1,
-                        "holeDiameter":r4(hole / PX),"viaDiameter":r4(dia / PX),"viaType":"NORMAL","topSolderExpansion":null,
+                        "holeDiameter":hd,"viaDiameter":vd,"viaType":"NORMAL","topSolderExpansion":null,
                         "bottomSolderExpansion":null,"locked":false,"unusedInnerLayers":[]});
-                    rec("VIA", body, new_id(), &mut out);
+                    w.push(
+                        "VIA",
+                        body,
+                        vec![json!(0), json!(net), json!(""), json!(c.0), json!(c.1), json!(hd), json!(vd), json!(0), Value::Null, Value::Null, json!(0), json!([])],
+                    );
                 }
                 NewObject::Pour { net, layer, ring } => {
                     let Some(lid) = layer_id(layer) else { continue };
@@ -954,20 +1159,38 @@ impl ProDoc {
                     }
                     pour_n += 1;
                     order += 1;
+                    let name = format!("POUR{pour_n}");
                     let body = json!({"partitionId":"","groupId":0,"netName":net,"layerId":lid,"width":0.2,
-                        "name":format!("POUR{pour_n}"),"order":order,"path":[path],"pourType":{"pourType":"SOLID","fineness":8},
+                        "name":name,"order":order,"path":[path],"pourType":{"pourType":"SOLID","fineness":8},
                         "keepIsland":false,"locked":false,"zIndex":-1});
-                    rec("POUR", body, new_id(), &mut out);
+                    w.push(
+                        "POUR",
+                        body,
+                        vec![json!(0), json!(net), json!(lid), json!(0.2), json!(name), json!(order), json!([path]), json!(["SOLID", 8]), json!(0), json!(0)],
+                    );
                 }
             }
         }
+        let out = w.lines;
         let n = out.len();
-        lines.splice(self.insert_at..self.insert_at, out);
-        let text = lines.join("\n");
+        let omit: HashSet<usize> = omit.iter().copied().collect();
+        let mut kept: Vec<String> = Vec::with_capacity(lines.len() + n);
+        for (i, l) in lines.into_iter().enumerate() {
+            if i == self.insert_at {
+                kept.extend(out.iter().cloned());
+            }
+            if !omit.contains(&i) {
+                kept.push(l);
+            }
+        }
+        if self.insert_at >= self.lines.len() {
+            kept.extend(out);
+        }
+        let text = kept.join("\n");
         Ok((self.pack(&text)?, n))
     }
 
-    /// The archive with the `.epru` entry replaced; every other entry is copied as it is.
+    /// The archive with the PCB entry replaced; every other entry is copied as it is.
     fn pack(&self, text: &str) -> Result<Vec<u8>, String> {
         let mut zin = zip::ZipArchive::new(Cursor::new(&self.bytes[..])).map_err(|e| e.to_string())?;
         let mut out = Cursor::new(Vec::new());
@@ -1127,7 +1350,7 @@ mod tests {
             NewObject::Via { net: "GND".into(), at: (10.0, -5.0), dia: 2.4, hole: 1.2 },
             NewObject::Pour { net: "GND".into(), layer: "In1".into(), ring: vec![(0.0, 0.0), (5.0, 0.0), (5.0, -5.0), (0.0, -5.0)] },
         ];
-        let (out, n) = pro.save(&add, &[]).unwrap();
+        let (out, n) = pro.save(&add, &[], &[]).unwrap();
         assert_eq!(n, 4); // two track segments, a via and a pour
         let (_, text) = read_epru(&out).unwrap();
         let (_, old) = read_epru(&bytes).unwrap();
@@ -1164,7 +1387,7 @@ mod tests {
         let Some(bytes) = sample() else { return };
         let doc = load(&bytes).unwrap();
         let pro = doc.pro.as_ref().unwrap();
-        let (out, _) = pro.save(&[], &[(0, 1.0, 2.0)]).unwrap(); // 10 mil right, 20 mil up
+        let (out, _) = pro.save(&[], &[(0, 1.0, 2.0)], &[]).unwrap(); // 10 mil right, 20 mil up
         let (_, old) = read_epru(&bytes).unwrap();
         let (_, new) = read_epru(&out).unwrap();
         let (lo, ln): (Vec<_>, Vec<_>) = (old.split('\n').collect(), new.split('\n').collect());
@@ -1173,5 +1396,112 @@ mod tests {
         let body = |l: &str| serde_json::from_str::<Value>(split_line(l).unwrap().1).unwrap();
         let (a, b) = (body(lo[pro.parts[0].comp]), body(ln[pro.parts[0].comp]));
         assert!((f(&b, "x") - f(&a, "x") - 10.0).abs() < 1e-6 && (f(&b, "y") - f(&a, "y") - 20.0).abs() < 1e-6);
+    }
+
+    fn sample_legacy() -> Option<Vec<u8>> {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ProPrj_stm32f767_2026-11-17.epro");
+        std::fs::read(p).ok()
+    }
+
+    /// The same project saved in the older `.epro` layout describes exactly the same board.
+    #[test]
+    fn legacy_project_matches_the_new_layout() {
+        let (Some(a), Some(b)) = (sample(), sample_legacy()) else { return };
+        let (new, old) = (load(&a).unwrap(), load(&b).unwrap());
+        assert!(old.pro.as_ref().unwrap().legacy && !new.pro.as_ref().unwrap().legacy);
+        assert_eq!(new.dsn, old.dsn);
+        assert_eq!(new.parts.len(), old.parts.len());
+        assert_eq!(new.areas, old.areas);
+        assert!(old.notes[0].contains(".epro)"), "{:?}", old.notes);
+    }
+
+    #[test]
+    fn saving_into_a_legacy_project_adds_records_in_its_layout() {
+        let Some(bytes) = sample_legacy() else { return };
+        let doc = load(&bytes).unwrap();
+        let pro = doc.pro.as_ref().unwrap();
+        let add = vec![
+            NewObject::Track { net: "GND".into(), layer: "2".into(), width: 1.0, pts: vec![(0.0, 0.0), (10.0, 0.0), (10.0, -5.0)] },
+            NewObject::Via { net: "GND".into(), at: (10.0, -5.0), dia: 2.4, hole: 1.2 },
+            NewObject::Pour { net: "GND".into(), layer: "In1".into(), ring: vec![(0.0, 0.0), (5.0, 0.0), (5.0, -5.0), (0.0, -5.0)] },
+        ];
+        let (out, n) = pro.save(&add, &[], &[]).unwrap();
+        assert_eq!(n, 4);
+        let mut z = zip::ZipArchive::new(Cursor::new(&out[..])).unwrap();
+        let text = read_entry(&mut z, &pro.epru_name).unwrap();
+        let mut zo = zip::ZipArchive::new(Cursor::new(&bytes[..])).unwrap();
+        let old = read_entry(&mut zo, &pro.epru_name).unwrap();
+        let (lo, ln): (Vec<_>, Vec<_>) = (old.split('\n').collect(), text.split('\n').collect());
+        assert_eq!(ln.len(), lo.len() + 4);
+        let at = pro.insert_at;
+        assert_eq!(&ln[..at], &lo[..at]);
+        assert_eq!(&ln[at + 4..], &lo[at..]);
+        let rec = |i: usize| serde_json::from_str::<Vec<Value>>(ln[at + i]).unwrap();
+        // ["LINE", id, group, net, layer, x1, y1, x2, y2, width, locked]
+        let l = rec(0);
+        assert_eq!((l[0].as_str(), l[3].as_str(), l[4].as_i64(), l[9].as_f64()), (Some("LINE"), Some("GND"), Some(2), Some(10.0)));
+        assert_eq!((l[5].as_f64(), l[6].as_f64(), l[7].as_f64(), l[8].as_f64()), (Some(0.0), Some(0.0), Some(100.0), Some(0.0)));
+        // ["VIA", id, group, net, rule, x, y, hole, diameter, ...]
+        let v = rec(2);
+        assert_eq!((v[0].as_str(), v[5].as_f64(), v[6].as_f64(), v[7].as_f64(), v[8].as_f64()), (Some("VIA"), Some(100.0), Some(50.0), Some(12.0), Some(24.0)));
+        // ["POUR", id, group, net, layer, width, name, order, path, ...]
+        let p = rec(3);
+        assert_eq!((p[0].as_str(), p[4].as_i64(), p[6].as_str()), (Some("POUR"), Some(15), Some("POUR2")));
+        // fresh, unused object ids
+        let ids: Vec<String> = (0..4).map(|i| rec(i)[1].as_str().unwrap().to_string()).collect();
+        assert_eq!(ids.iter().collect::<HashSet<_>>().len(), 4);
+        assert!(ids.iter().all(|i| !pro.ids.contains(i)), "{ids:?}");
+        // loads again with the new copper in it
+        let again = load(&out).unwrap();
+        let b = crate::parse_dsn(&again.dsn).unwrap();
+        assert_eq!((b.wires.len(), b.vias.len()), (6 + 2, 6 + 1));
+        assert!(again.areas.contains(&("GND".to_string(), "In1".to_string())));
+    }
+
+    #[test]
+    fn moving_a_part_of_a_legacy_project_moves_its_labels_too() {
+        let Some(bytes) = sample_legacy() else { return };
+        let doc = load(&bytes).unwrap();
+        let pro = doc.pro.as_ref().unwrap();
+        let (out, _) = pro.save(&[], &[(0, 1.0, 2.0)], &[]).unwrap();
+        let mut z = zip::ZipArchive::new(Cursor::new(&out[..])).unwrap();
+        let new = read_entry(&mut z, &pro.epru_name).unwrap();
+        let ln: Vec<&str> = new.split('\n').collect();
+        let changed: Vec<usize> = (0..pro.lines.len()).filter(|&i| pro.lines[i] != ln[i]).collect();
+        assert!(changed.contains(&pro.parts[0].comp) && changed.len() == 1 + pro.parts[0].attrs.len(), "{changed:?}");
+        let (a, b) = (
+            serde_json::from_str::<Vec<Value>>(&pro.lines[pro.parts[0].comp]).unwrap(),
+            serde_json::from_str::<Vec<Value>>(ln[pro.parts[0].comp]).unwrap(),
+        );
+        assert!((b[4].as_f64().unwrap() - a[4].as_f64().unwrap() - 10.0).abs() < 1e-6);
+        assert!((b[5].as_f64().unwrap() - a[5].as_f64().unwrap() - 20.0).abs() < 1e-6);
+    }
+
+    /// The tracks and vias that were on the board can be left out of the saved project, in both
+    /// file layouts, and nothing else goes with them.
+    #[test]
+    fn existing_tracks_and_vias_can_be_left_out() {
+        for bytes in [sample(), sample_legacy()].into_iter().flatten() {
+            let doc = load(&bytes).unwrap();
+            let pro = doc.pro.as_ref().unwrap();
+            // six track segments and six vias
+            assert_eq!(doc.existing.len(), 12);
+            let (out, _) = pro.save(&[], &[], &doc.existing).unwrap();
+            let again = load(&out).unwrap();
+            let (b0, b1) = (crate::parse_dsn(&doc.dsn).unwrap(), crate::parse_dsn(&again.dsn).unwrap());
+            assert_eq!((b1.wires.len(), b1.vias.len()), (0, 0));
+            assert_eq!(b1.abs_pins().len(), b0.abs_pins().len());
+            assert_eq!((b1.planes.len(), b1.keepouts.len()), (b0.planes.len(), b0.keepouts.len()));
+            // exactly those lines are gone
+            let mut z = zip::ZipArchive::new(Cursor::new(&out[..])).unwrap();
+            let new = read_entry(&mut z, &pro.epru_name).unwrap();
+            assert_eq!(new.split('\n').count(), pro.lines.len() - 12);
+            // omitting and adding at once keeps the new records at the end of the PCB
+            let add = vec![NewObject::Via { net: "GND".into(), at: (1.0, -1.0), dia: 2.4, hole: 1.2 }];
+            let (out, n) = pro.save(&add, &[], &doc.existing).unwrap();
+            assert_eq!(n, 1);
+            let b2 = crate::parse_dsn(&load(&out).unwrap().dsn).unwrap();
+            assert_eq!((b2.wires.len(), b2.vias.len()), (0, 1));
+        }
     }
 }

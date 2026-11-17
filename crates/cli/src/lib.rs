@@ -3,13 +3,13 @@ use std::path::PathBuf;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: autorouter -nogui <in.dsn | in.json | in.epro2> -o <out.ses | out.json | out.epro2> [options]
+        "usage: autorouter -nogui <in.dsn | in.json | in.epro2 | in.epro> -o <out.ses | out.json | out.epro2 | out.epro> [options]
 
   An EasyEDA Standard source file (File > Export > EasyEDA source) as input is routed and
   written back as EasyEDA JSON (-o *.json, default <name>-routed.json) with real track
   widths, vias and copper areas for the layer-assigned nets. -o *.ses writes a session file.
-  An EasyEDA Pro project (*.epro2) is routed the same way and written back as a Pro project
-  (-o *.epro2, default <name>-routed.epro2): the PCB gets the new tracks, vias and copper pours,
+  An EasyEDA Pro project (*.epro2, or the older *.epro) is routed the same way and written back
+  as a Pro project in the same format (-o *.epro2 / *.epro, default <name>-routed.<ext>): the PCB gets the new tracks, vias and copper pours,
   everything else in the project stays as it was.
   --no-fills             EasyEDA JSON: do not create copper areas
   --pour-reach-mm X      EasyEDA JSON: copper areas reach at most X mm from copper of their own
@@ -32,7 +32,9 @@ fn usage() -> ! {
   --skip NET1,NET2       leave these nets unrouted
   --net-width NET=W      override a net's trace width (repeatable)
   --net-clearance NET=C  override a net's clearance (repeatable)
-  --include-existing     also write the DSN's existing wiring into the SES
+  --include-existing     also write the existing wiring: into the SES, or (EasyEDA JSON, Pro
+                         project) keep the tracks and vias that were on the board in the saved
+                         file. Without it the saved EasyEDA file holds only the new routing.
   --allow-vias-in-pads   allow new vias to overlap pads (default off)
   --no-neckdown          disable local 50% width fallback (default on)
   --allow-plane-cuts     disable protection of imported planes
@@ -294,7 +296,7 @@ pub fn run() {
         i += 1;
     }
     let input = input.unwrap_or_else(|| usage());
-    let is_pro = input.extension().is_some_and(|e| e.eq_ignore_ascii_case("epro2"));
+    let is_pro = input.extension().is_some_and(|e| e.eq_ignore_ascii_case("epro2") || e.eq_ignore_ascii_case("epro"));
     let is_json = is_pro || input.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"));
     if is_json {
         // EasyEDA keeps track widths and has copper areas
@@ -314,12 +316,12 @@ pub fn run() {
     let out = out.unwrap_or_else(|| {
         if is_json {
             let stem = input.file_stem().unwrap_or_default().to_string_lossy().to_string();
-            input.with_file_name(format!("{stem}-routed.{}", if is_pro { "epro2" } else { "json" }))
+            input.with_file_name(format!("{stem}-routed.{}", if is_pro { input.extension().map_or("epro2".to_string(), |e| e.to_string_lossy().to_lowercase()) } else { "json".to_string() }))
         } else {
             input.with_extension("ses")
         }
     });
-    // an .epro2 is a ZIP archive, everything else is text
+    // an .epro2 / .epro is a ZIP archive, everything else is text
     let raw = std::fs::read(&input).expect("cannot read input file");
     let src = if is_pro { String::new() } else { String::from_utf8(raw.clone()).expect("input file is not valid UTF-8") };
     let doc = if is_json {
@@ -446,7 +448,7 @@ pub fn run() {
         eprintln!("warning: some differential groups exceed their length tolerance");
     }
     assert!(!r.cfg.pairs || r.pair_report().iter().all(|p| p.coupled), "SES export blocked: a differential group is not routed together. Adjust options or explicitly disable pairs.");
-    let json_out = doc.is_some() && out.extension().is_some_and(|e| e.eq_ignore_ascii_case("json") || e.eq_ignore_ascii_case("epro2"));
+    let json_out = doc.is_some() && out.extension().is_some_and(|e| e.eq_ignore_ascii_case("json") || e.eq_ignore_ascii_case("epro2") || e.eq_ignore_ascii_case("epro"));
     if let (true, Some(d)) = (json_out, &doc) {
         let (bytes, st) = router::easyeda_out::write_output(&r, d).unwrap_or_else(|e| {
             eprintln!("cannot write the EasyEDA file: {e}");
@@ -461,6 +463,12 @@ pub fn run() {
             st.areas,
             if r.outline_stats.1 > 0 { format!(" ({} pour piece(s) skipped)", r.outline_stats.1) } else { String::new() }
         );
+        if st.omitted > 0 {
+            println!(
+                "note: {} existing track(s)/via(s) are not in the saved file (they are shown in the preview only); nets that rely on them are open in that file. Use --include-existing to keep them",
+                st.omitted
+            );
+        }
         for w in &r.pour_warnings {
             println!("WARNING copper area: {w}");
         }

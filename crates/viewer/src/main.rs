@@ -215,7 +215,7 @@ struct RunResult {
     ses: String,
     /// routed EasyEDA source JSON or Pro project (when the board was loaded from one)
     json: Option<Vec<u8>>,
-    /// `json` is an EasyEDA Pro project (.epro2), not Standard JSON text
+    /// `json` is an EasyEDA Pro project (.epro2 / .epro), not Standard JSON text
     pro: bool,
     text: String,
     export_ok: bool,
@@ -420,7 +420,7 @@ impl App {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| path.to_string());
         let path = abs.as_str();
-        let is_pro = path.to_lowercase().ends_with(".epro2");
+        let is_pro = path.to_lowercase().ends_with(".epro2") || path.to_lowercase().ends_with(".epro");
         let raw = match std::fs::read(path) {
             Ok(b) => b,
             Err(e) => {
@@ -429,7 +429,7 @@ impl App {
                 return;
             }
         };
-        // an .epro2 is a ZIP archive, everything else is text
+        // an .epro2 / .epro is a ZIP archive, everything else is text
         let src = if is_pro {
             String::new()
         } else {
@@ -806,6 +806,12 @@ impl App {
                     if pro { "Pro project" } else { "JSON" },
                     st.tracks, st.vias, st.areas
                 );
+                if st.omitted > 0 {
+                    text += &format!(
+                        "{} existing track(s)/via(s) are not in the saved file (shown ghosted); nets that rely on them are open in that file. Tick 'Keep the existing tracks and vias in the saved file' to keep them.\n",
+                        st.omitted
+                    );
+                }
             }
             let _ = tx.send(Msg::Done(Box::new(RunResult {
                 json: json.map(|j| j.0),
@@ -879,7 +885,7 @@ impl App {
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         let Some(board) = self.board.clone() else {
-            ui.label("Open a .dsn, an EasyEDA source .json or an EasyEDA Pro .epro2 file to begin.");
+            ui.label("Open a .dsn, an EasyEDA source .json or an EasyEDA Pro .epro2 / .epro file to begin.");
             return;
         };
         let k = self.k();
@@ -1161,6 +1167,10 @@ impl App {
                         .on_hover_text("Draws the area a pour of each layer-assigned net would cover as a thin closed trace on its layer. Re-trace it as a copper area in the CAD, then delete the trace.");
                     ui.checkbox(&mut self.cfg.include_existing, "Also write the existing wiring to the SES")
                         .on_hover_text("Existing traces always stay on the board. Off: the SES only holds the new routes.");
+                }
+                if json_mode {
+                    ui.checkbox(&mut self.cfg.include_existing, "Keep the existing tracks and vias in the saved file")
+                        .on_hover_text("The tracks and vias that are already on the board are always shown and routed around. Off: the saved file holds only the new routing, the existing ones are left out (they show ghosted in the preview), so nets that rely on them are open in that file. On: they stay in the saved file.");
                 }
                 ui.checkbox(&mut self.cfg.protect_planes, "Do not cut imported copper areas")
                     .on_hover_text("On: traces avoid the copper areas that are already in the file (a trace may still cross one with a penalty, see Existing areas). Off: they may be cut freely.");
@@ -1562,20 +1572,27 @@ impl App {
                 }
             }
         }
-        // existing copper (kept)
+        // existing copper (kept on the board and always shown; ghosted when the saved EasyEDA file
+        // will not contain it)
+        let ghost = self.easyeda.is_some() && !self.cfg.include_existing;
         if let Some(pv) = &self.preview {
             for (net, w) in &pv.pre_wires {
                 if !shown(w.layer) {
                     continue;
                 }
                 let wd = (w.width as f32 * scale).max(1.0);
-                let c = col(w.layer, if dim(*net as i32) { 40 } else { 200 });
+                let c = col(w.layer, if dim(*net as i32) { 40 } else if ghost { 95 } else { 200 });
                 for seg in w.pts.windows(2) {
                     let (a, b2) = (tr(seg[0].0, seg[0].1), tr(seg[1].0, seg[1].1));
-                    painter.line_segment(
-                        [a, b2],
-                        Stroke::new(wd + 2.0, Color32::from_rgba_unmultiplied(255, 255, 255, 70)),
-                    );
+                    if ghost {
+                        // outline only: this copper is not part of the saved file
+                        painter.line_segment([a, b2], Stroke::new(wd + 2.0, Color32::from_rgba_unmultiplied(255, 255, 255, 40)));
+                    } else {
+                        painter.line_segment(
+                            [a, b2],
+                            Stroke::new(wd + 2.0, Color32::from_rgba_unmultiplied(255, 255, 255, 70)),
+                        );
+                    }
                     painter.line_segment([a, b2], Stroke::new(wd, c));
                     painter.circle_filled(a, wd / 2.0, c);
                     painter.circle_filled(b2, wd / 2.0, c);
@@ -1583,8 +1600,14 @@ impl App {
             }
             for (_, v, r) in &pv.pre_vias {
                 let c = tr(v.0, v.1);
-                painter.circle_filled(c, *r as f32 * scale, Color32::from_rgb(190, 190, 190));
-                painter.circle_filled(c, *r as f32 * scale * 0.45, Color32::from_rgb(18, 18, 22));
+                if ghost {
+                    painter.circle_filled(c, *r as f32 * scale, Color32::from_rgba_unmultiplied(190, 190, 190, 70));
+                    painter.circle_stroke(c, *r as f32 * scale, Stroke::new(1.0, Color32::from_rgb(190, 190, 190)));
+                    painter.circle_filled(c, *r as f32 * scale * 0.45, Color32::from_rgb(18, 18, 22));
+                } else {
+                    painter.circle_filled(c, *r as f32 * scale, Color32::from_rgb(190, 190, 190));
+                    painter.circle_filled(c, *r as f32 * scale * 0.45, Color32::from_rgb(18, 18, 22));
+                }
             }
             // everything else that is on the board but belongs to no net: copper without a net
             // in its layer colour, keep-outs (holes, slots, regions) hatched in red
@@ -1836,7 +1859,7 @@ impl eframe::App for App {
             ui.horizontal_wrapped(|ui| {
                 if ui.button("📂 Open DSN / EasyEDA…").clicked() {
                     if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("Specctra DSN, EasyEDA source or EasyEDA Pro project", &["dsn", "json", "epro2"])
+                        .add_filter("Specctra DSN, EasyEDA source or EasyEDA Pro project", &["dsn", "json", "epro2", "epro"])
                         .pick_file()
                     {
                         let p = p.to_string_lossy().to_string();
@@ -1874,7 +1897,7 @@ impl eframe::App for App {
                         })
                         .clicked()
                     {
-                        let ext = if pro { "epro2" } else { "json" };
+                        let ext = if pro && self.path.to_lowercase().ends_with(".epro") { "epro" } else if pro { "epro2" } else { "json" };
                         let stem = std::path::Path::new(&self.path)
                             .file_stem()
                             .map(|s| s.to_string_lossy().to_string())

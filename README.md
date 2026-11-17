@@ -11,19 +11,21 @@ Export the project with **File > Export > EasyEDA source** and open the resultin
 - A DSN has no copper areas, solid regions, rectangles, circles, arcs, drill holes, board cutouts or vias that are part of a footprint. The router would route straight through them and EasyEDA would report DRC errors when you import the result.
 - The routing result of a DSN workflow is an SES file, and an SES file cannot carry track widths or copper areas back into EasyEDA.
 
-The JSON contains all of it, and the result is written back into a copy of the same JSON. Nothing that was already in the project is changed, new tracks, vias and areas are appended (the only exception are small parts, if you enable nudging).
+The JSON contains all of it, and the result is written back into a copy of the same JSON. Nothing else in the project is changed, new tracks, vias and areas are appended (the only exception are small parts, if you enable nudging). The tracks and vias that were already on the board are always shown and routed around, but they are left out of the saved file unless you enable **Keep the existing tracks and vias in the saved file** (`--include-existing`), like the SES, which holds only the new routes. Left out, the nets that rely on them stay open in that file.
 
 ## EasyEDA Pro projects
 
-EasyEDA Pro projects (`.epro2`) can be opened directly, no export is needed. The router reads the PCB of the project (its footprints, pads with round and slot holes, tracks, vias, solid fills, copper pours, slot regions, board outline and cut-outs, design rules) and keeps clear of all of it. The result is saved as a new `.epro2`: the new tracks, vias and copper pours are appended to the PCB, everything else in the project (schematic, libraries, images, existing PCB objects) stays byte for byte as it was.
+EasyEDA Pro projects can be opened directly, no export is needed. Both file formats work: `.epro2` and the older `.epro` (one file per document inside the archive). The result is saved in the format that was opened. The router reads the PCB of the project (its footprints, pads with round and slot holes, tracks, vias, solid fills, copper pours, slot regions, board outline and cut-outs, design rules) and keeps clear of all of it. The result is saved as a new project file: the new tracks, vias and copper pours are appended to the PCB, everything else in the project (schematic, libraries, images, footprints, regions, pours, parts) stays as it was. The existing tracks and vias of the PCB are shown in the preview (ghosted when they will not be saved) and left out of the saved file unless **Keep the existing tracks and vias in the saved file** (`--include-existing`) is on.
 
 ```
 autorouter.exe -nogui project.epro2 -o project-routed.epro2
+autorouter.exe -nogui project.epro -o project-routed.epro
 ```
 
 Notes for Pro projects:
 
 - A project with several PCBs uses the one with the most parts.
+- In the older `.epro` format arcs, circles, rectangles, ellipses and text on copper are reported and ignored (their layout is not known), the `.epro2` reader handles arcs and circles.
 - Rules come from the active default rules of the PCB: track width, via size and the largest of the track, pad and via clearances. Per net rules of Pro are not read, set them in the **Nets** tab.
 - Inner layers show up as `In1`, `In2`, ... in the layer lists.
 - Pours are written as outlines. Rebuild the copper pours in EasyEDA Pro after opening the result and run the DRC.
@@ -110,6 +112,7 @@ The settings of every run are saved next to the result as `board-routed.options.
 | Create copper areas for the nets assigned to a layer | The pours. They reach at most the given distance from the copper of their own net. |
 | Fill the empty space of every layer | Fills free room with the fill net (default GND) on all layers and adds stitching vias on the given pitch. |
 | Do not cut imported copper areas | Traces keep out of copper areas that are already in the project. |
+| Keep the existing tracks and vias in the saved file | EasyEDA JSON and Pro projects. Off (default): the saved file holds only the new routing, the existing tracks and vias are left out and shown ghosted in the preview. On: they stay in the file. For DSN files the same option writes them into the SES. |
 | Clean-up passes | Re-routes nets after the first pass to shorten traces and remove vias. |
 | Route differential pairs together | Pairs (+/-, _P/_N, DP/DN) are routed side by side with a fixed gap. |
 | Last resorts | Jumps on plane layers, via inside a pad, and nudging small SMD parts (at most 3 part sizes, never ICs, connectors or through-hole parts). Only used for connections that stay open. |
