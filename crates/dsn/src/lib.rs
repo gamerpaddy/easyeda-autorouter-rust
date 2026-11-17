@@ -1,6 +1,7 @@
 //! Specctra DSN parser (own implementation) producing a typed `Board`.
 
 pub mod easyeda;
+pub mod easyeda_pro;
 
 use std::collections::HashMap;
 

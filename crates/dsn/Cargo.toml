@@ -5,3 +5,5 @@ edition = "2021"
 
 [dependencies]
 serde_json = { version = "1", features = ["preserve_order"] }
+zip = { version = "9.6.1", default-features = false, features = ["deflate-flate2"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

@@ -13,6 +13,22 @@ Export the project with **File > Export > EasyEDA source** and open the resultin
 
 The JSON contains all of it, and the result is written back into a copy of the same JSON. Nothing that was already in the project is changed, new tracks, vias and areas are appended (the only exception are small parts, if you enable nudging).
 
+## EasyEDA Pro projects
+
+EasyEDA Pro projects (`.epro2`) can be opened directly, no export is needed. The router reads the PCB of the project (its footprints, pads with round and slot holes, tracks, vias, solid fills, copper pours, slot regions, board outline and cut-outs, design rules) and keeps clear of all of it. The result is saved as a new `.epro2`: the new tracks, vias and copper pours are appended to the PCB, everything else in the project (schematic, libraries, images, existing PCB objects) stays byte for byte as it was.
+
+```
+autorouter.exe -nogui project.epro2 -o project-routed.epro2
+```
+
+Notes for Pro projects:
+
+- A project with several PCBs uses the one with the most parts.
+- Rules come from the active default rules of the PCB: track width, via size and the largest of the track, pad and via clearances. Per net rules of Pro are not read, set them in the **Nets** tab.
+- Inner layers show up as `In1`, `In2`, ... in the layer lists.
+- Pours are written as outlines. Rebuild the copper pours in EasyEDA Pro after opening the result and run the DRC.
+- Not verified against real boards: parts on the bottom side (mirrored about the vertical axis), centre-point arcs (`CARC`, replaced by their chord) and pad shapes other than rectangle, oval and circle (replaced by their bounding rectangle). The output says so when it meets them.
+
 ## Features
 
 - Routes two to four layer boards with the track width, clearance and via size of your project, per net if you set them.

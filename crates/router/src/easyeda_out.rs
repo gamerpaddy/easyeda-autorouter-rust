@@ -1,10 +1,11 @@
-//! Write a routed board back into the EasyEDA Standard source JSON it was loaded from:
-//! tracks with their real widths, vias and copper areas are appended to the document's shapes;
-//! everything else in the document is left exactly as it was.
+//! Write a routed board back into the EasyEDA document it was loaded from: the Standard source
+//! JSON or an EasyEDA Pro project (`.epro2`). Tracks with their real widths, vias and copper areas
+//! are appended to the document; everything else in it is left exactly as it was.
 
 use crate::engine::Router;
 use crate::geom::{dist, P};
 use dsn::easyeda::{EasyedaDoc, PX_MM};
+use dsn::easyeda_pro::{NewObject, ProDoc};
 use serde_json::Value;
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -118,4 +119,65 @@ pub fn write_json(r: &Router, doc: &EasyedaDoc) -> (String, JsonStats) {
         shapes.extend(add.into_iter().map(Value::String));
     }
     (serde_json::to_string(&root).unwrap_or_default(), stats)
+}
+
+/// The routed board in the format it was loaded from: the Standard JSON text, or the Pro project
+/// archive with the new objects added to its PCB.
+pub fn write_output(r: &Router, doc: &EasyedaDoc) -> Result<(Vec<u8>, JsonStats), String> {
+    match &doc.pro {
+        Some(p) => write_epro2(r, doc, p),
+        None => {
+            let (text, st) = write_json(r, doc);
+            Ok((text.into_bytes(), st))
+        }
+    }
+}
+
+/// New tracks, vias and copper pours as objects of an EasyEDA Pro PCB.
+pub fn write_epro2(r: &Router, doc: &EasyedaDoc, pro: &ProDoc) -> Result<(Vec<u8>, JsonStats), String> {
+    let unit = if r.unit_mm > 0.0 { r.unit_mm } else { PX_MM };
+    let mut add: Vec<NewObject> = vec![];
+    let mut stats = JsonStats::default();
+    for n in &r.nets {
+        for w in n.r.wires.iter().filter(|w| !w.fill) {
+            let mut pts: Vec<P> = vec![];
+            for &p in &w.pts {
+                if pts.last().is_none_or(|&q| dist(q, p) > 1e-6) {
+                    pts.push(p);
+                }
+            }
+            if pts.len() < 2 {
+                continue;
+            }
+            stats.tracks += pts.len() - 1;
+            add.push(NewObject::Track {
+                net: n.name.clone(),
+                layer: r.layer_names[w.layer].clone(),
+                width: w.width,
+                pts: pts.iter().map(|&p| doc.to_json_xy(p)).collect(),
+            });
+        }
+        for &v in &n.r.vias {
+            let dia = 2.0 * n.via_r;
+            // at least the hole of the project's via rule
+            let mut drill = (r.cfg.rules.min_via_drill_mm / unit).max(pro.via_hole_mil * 0.1);
+            if drill <= 0.0 || drill > dia * 0.8 {
+                drill = dia * 0.5;
+            }
+            add.push(NewObject::Via { net: n.name.clone(), at: doc.to_json_xy(v), dia, hole: drill });
+            stats.vias += 1;
+        }
+    }
+    for (net, layer, ring) in &r.fill_polys {
+        let name = &r.nets[*net].name;
+        let lname = &r.layer_names[*layer];
+        let is_fill = r.fill_net_index() == Some(*net) && r.fill_applies(*layer, *net);
+        if doc.areas.contains(&(name.clone(), lname.clone())) && !is_fill {
+            continue;
+        }
+        add.push(NewObject::Pour { net: name.clone(), layer: lname.clone(), ring: ring.iter().map(|&p| doc.to_json_xy(p)).collect() });
+        stats.areas += 1;
+    }
+    let (bytes, _) = pro.save(&add, &r.part_moves)?;
+    Ok((bytes, stats))
 }

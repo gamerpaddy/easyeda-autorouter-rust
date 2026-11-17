@@ -3,11 +3,14 @@ use std::path::PathBuf;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: autorouter -nogui <in.dsn | in.json> -o <out.ses | out.json> [options]
+        "usage: autorouter -nogui <in.dsn | in.json | in.epro2> -o <out.ses | out.json | out.epro2> [options]
 
   An EasyEDA Standard source file (File > Export > EasyEDA source) as input is routed and
   written back as EasyEDA JSON (-o *.json, default <name>-routed.json) with real track
   widths, vias and copper areas for the layer-assigned nets. -o *.ses writes a session file.
+  An EasyEDA Pro project (*.epro2) is routed the same way and written back as a Pro project
+  (-o *.epro2, default <name>-routed.epro2): the PCB gets the new tracks, vias and copper pours,
+  everything else in the project stays as it was.
   --no-fills             EasyEDA JSON: do not create copper areas
   --pour-reach-mm X      EasyEDA JSON: copper areas reach at most X mm from copper of their own
                          net (default 4)
@@ -291,7 +294,8 @@ pub fn run() {
         i += 1;
     }
     let input = input.unwrap_or_else(|| usage());
-    let is_json = input.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"));
+    let is_pro = input.extension().is_some_and(|e| e.eq_ignore_ascii_case("epro2"));
+    let is_json = is_pro || input.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"));
     if is_json {
         // EasyEDA keeps track widths and has copper areas
         cfg.keep_track_widths = true;
@@ -310,14 +314,16 @@ pub fn run() {
     let out = out.unwrap_or_else(|| {
         if is_json {
             let stem = input.file_stem().unwrap_or_default().to_string_lossy().to_string();
-            input.with_file_name(format!("{stem}-routed.json"))
+            input.with_file_name(format!("{stem}-routed.{}", if is_pro { "epro2" } else { "json" }))
         } else {
             input.with_extension("ses")
         }
     });
-    let src = std::fs::read_to_string(&input).expect("cannot read input file");
+    // an .epro2 is a ZIP archive, everything else is text
+    let raw = std::fs::read(&input).expect("cannot read input file");
+    let src = if is_pro { String::new() } else { String::from_utf8(raw.clone()).expect("input file is not valid UTF-8") };
     let doc = if is_json {
-        let d = dsn::easyeda::load(&src).unwrap_or_else(|e| {
+        let d = (if is_pro { dsn::easyeda_pro::load(&raw) } else { dsn::easyeda::load(&src) }).unwrap_or_else(|e| {
             eprintln!("EasyEDA file error: {e}");
             std::process::exit(2)
         });
@@ -440,12 +446,16 @@ pub fn run() {
         eprintln!("warning: some differential groups exceed their length tolerance");
     }
     assert!(!r.cfg.pairs || r.pair_report().iter().all(|p| p.coupled), "SES export blocked: a differential group is not routed together. Adjust options or explicitly disable pairs.");
-    let json_out = doc.is_some() && out.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"));
+    let json_out = doc.is_some() && out.extension().is_some_and(|e| e.eq_ignore_ascii_case("json") || e.eq_ignore_ascii_case("epro2"));
     if let (true, Some(d)) = (json_out, &doc) {
-        let (text, st) = router::easyeda_out::write_json(&r, d);
-        std::fs::write(&out, text).expect("cannot write json");
+        let (bytes, st) = router::easyeda_out::write_output(&r, d).unwrap_or_else(|e| {
+            eprintln!("cannot write the EasyEDA file: {e}");
+            std::process::exit(2)
+        });
+        std::fs::write(&out, bytes).expect("cannot write EasyEDA file");
         println!(
-            "EasyEDA JSON: {} track(s), {} via(s), {} copper area(s) added{}",
+            "EasyEDA {}: {} track(s), {} via(s), {} copper area(s) added{}",
+            if d.pro.is_some() { "Pro project" } else { "JSON" },
             st.tracks,
             st.vias,
             st.areas,
@@ -455,7 +465,7 @@ pub fn run() {
             println!("WARNING copper area: {w}");
         }
         if !r.fill_polys.is_empty() {
-            println!("note: copper areas are outlines only; press Ctrl+B (Rebuild Copper Area) in EasyEDA to cut around pads and traces");
+            println!("note: copper areas are outlines only; rebuild them in EasyEDA (Ctrl+B in EasyEDA Standard) to cut around pads and traces");
         }
     } else {
         std::fs::write(&out, ses::write_ses(&r, &name)).expect("cannot write ses");

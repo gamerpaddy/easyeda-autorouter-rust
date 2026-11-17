@@ -713,3 +713,61 @@ fn objects_without_a_net_are_obstacles_and_in_the_preview() {
     }
     assert_eq!(router::drc::check(&r).open_nets.len(), 0);
 }
+
+/// An EasyEDA Pro project (STM32F767 board with a slot, regions, a pour, two routed nets): route
+/// it, write it back as .epro2, load the result again.
+#[test]
+fn easyeda_pro_project_routes_and_round_trips() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ProPrj_stm32f767_2026-11-17.epro2");
+    let Ok(bytes) = std::fs::read(path) else { return };
+    let doc = dsn::easyeda_pro::load(&bytes).unwrap();
+    let board = dsn::parse_dsn(&doc.dsn).unwrap();
+    let mut cfg = Config { verbose: false, unit_mm: Some(0.254), keep_track_widths: true, pour_polygons: true, ..Config::default() };
+    cfg.use_trace_routing();
+    let mut r = Router::new(&board, cfg);
+    r.route_all();
+    r.finish();
+    let report = drc::check(&r);
+    assert!(report.clearance_violations.is_empty(), "{:?}", report.clearance_violations);
+    assert!(report.open_nets.is_empty(), "{:?}", report.open_nets);
+
+    let (out, st) = router::easyeda_out::write_output(&r, &doc).unwrap();
+    assert!(st.tracks > 100 && st.vias > 10, "{st:?}");
+    let again = dsn::easyeda_pro::load(&out).unwrap();
+    let b2 = dsn::parse_dsn(&again.dsn).unwrap();
+    // everything of the original project is still there, plus the new tracks and vias
+    assert_eq!(b2.wires.len(), board.wires.len() + st.tracks);
+    assert_eq!(b2.vias.len(), board.vias.len() + st.vias);
+    assert_eq!(b2.abs_pins().len(), board.abs_pins().len());
+    assert_eq!(b2.nets.len(), board.nets.len());
+
+    // the slot region (x 420..560 mil, y 715..860 mil) stays free of new copper
+    let zip_text = {
+        use std::io::Read;
+        let mut z = zip::ZipArchive::new(std::io::Cursor::new(&out)).unwrap();
+        let mut t = String::new();
+        z.by_name("stm32f767.epru").unwrap().read_to_string(&mut t).unwrap();
+        t
+    };
+    let old_text = {
+        use std::io::Read;
+        let mut z = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).unwrap();
+        let mut t = String::new();
+        z.by_name("stm32f767.epru").unwrap().read_to_string(&mut t).unwrap();
+        t
+    };
+    let old: std::collections::HashSet<&str> = old_text.split('\n').collect();
+    let new_lines: Vec<&str> = zip_text.split('\n').filter(|l| !old.contains(l) && l.contains("}||")).collect();
+    assert_eq!(zip_text.split('\n').filter(|l| old.contains(l)).count() + new_lines.len(), zip_text.split('\n').count());
+    assert_eq!(new_lines.iter().filter(|l| l.contains("\"type\":\"LINE\"")).count(), st.tracks);
+    assert_eq!(new_lines.iter().filter(|l| l.contains("\"type\":\"VIA\"")).count(), st.vias);
+    let in_slot = |x: f64, y: f64| (420.0..=560.0).contains(&x) && (715.0..=860.0).contains(&y);
+    for l in new_lines.iter().filter(|l| l.contains("\"type\":\"LINE\"") || l.contains("\"type\":\"VIA\"")) {
+        let v: serde_json::Value = serde_json::from_str(l.split("}||").nth(1).unwrap().trim_end_matches('|')).unwrap();
+        let g = |k: &str| v[k].as_f64();
+        let pts = [(g("startX"), g("startY")), (g("endX"), g("endY")), (g("centerX"), g("centerY"))];
+        for (x, y) in pts.into_iter().filter_map(|(x, y)| Some((x?, y?))) {
+            assert!(!in_slot(x, y), "new copper inside the slot at {x},{y}: {l}");
+        }
+    }
+}

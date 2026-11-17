@@ -14,7 +14,7 @@ pub const PX_MM: f64 = 0.254;
 
 /// Added to every clearance. EasyEDA's own DSN export lists 0.6034 as the default clearance where
 /// the rule says 0.5984, and its DRC flags gaps in between; routing 0.01 wider is never flagged.
-const CLEARANCE_MARGIN: f64 = 0.01;
+pub(crate) const CLEARANCE_MARGIN: f64 = 0.01;
 
 pub struct EasyedaDoc {
     pub root: Value,
@@ -30,6 +30,8 @@ pub struct EasyedaDoc {
     pub areas: HashSet<(String, String)>,
     /// every object id in the document (new ids must not collide)
     pub ids: HashSet<String>,
+    /// set when the document is an EasyEDA Pro project (`.epro2`); `root` is empty then
+    pub pro: Option<crate::easyeda_pro::ProDoc>,
 }
 
 impl EasyedaDoc {
@@ -50,6 +52,8 @@ impl EasyedaDoc {
         }
     }
 
+    /// Router coordinates to document coordinates. For a Pro project this is still the Standard
+    /// space (10 mil units, y down); `ProDoc::from_std` turns it into mil, y up.
     pub fn to_json_xy(&self, p: (f64, f64)) -> (f64, f64) {
         (p.0 + self.ox, self.oy - p.1)
     }
@@ -426,31 +430,31 @@ fn copper_layers(id: &str, layers: &[String]) -> Vec<String> {
 }
 
 /// A copper object that is not a plain track or pad.
-struct Stroke {
-    width: f64,
-    layer: String,
-    net: String,
-    pts: Vec<(f64, f64)>,
+pub(crate) struct Stroke {
+    pub(crate) width: f64,
+    pub(crate) layer: String,
+    pub(crate) net: String,
+    pub(crate) pts: Vec<(f64, f64)>,
 }
 
-struct Region {
-    layer: String,
-    net: String,
-    pts: Vec<(f64, f64)>,
+pub(crate) struct Region {
+    pub(crate) layer: String,
+    pub(crate) net: String,
+    pub(crate) pts: Vec<(f64, f64)>,
     /// a copper area or a solid region that is copper (otherwise: keep everything out)
-    copper: bool,
+    pub(crate) copper: bool,
 }
 
-struct Pad {
-    shape: String,
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-    layer: String,
-    net: String,
-    pts: Vec<(f64, f64)>,
-    rot: f64,
+pub(crate) struct Pad {
+    pub(crate) shape: String,
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+    pub(crate) w: f64,
+    pub(crate) h: f64,
+    pub(crate) layer: String,
+    pub(crate) net: String,
+    pub(crate) pts: Vec<(f64, f64)>,
+    pub(crate) rot: f64,
 }
 
 fn num(v: f64) -> String {
@@ -498,7 +502,7 @@ fn quote(s: &str) -> String {
 }
 
 /// Stadium (slot) around the segment a-b with radius r, relative to `c`.
-fn stadium(a: (f64, f64), b: (f64, f64), r: f64, c: (f64, f64)) -> Vec<(f64, f64)> {
+pub(crate) fn stadium(a: (f64, f64), b: (f64, f64), r: f64, c: (f64, f64)) -> Vec<(f64, f64)> {
     let ang = (b.1 - a.1).atan2(b.0 - a.0);
     let mut out = vec![];
     let n = 12;
@@ -566,7 +570,7 @@ pub fn load(text: &str) -> Result<EasyedaDoc, String> {
     if root.get("head").and_then(|h| h.get("docType")).and_then(|d| d.as_str()) != Some("3") {
         return Err("this is not an EasyEDA PCB document (docType 3)".into());
     }
-    let mut notes: Vec<String> = vec![];
+    let notes: Vec<String> = vec![];
     let mut pads: Vec<Pad> = vec![];
     let mut holes: Vec<(f64, f64, f64)> = vec![];
     let mut outline: Vec<Vec<(f64, f64)>> = vec![];
@@ -758,6 +762,72 @@ pub fn load(text: &str) -> Result<EasyedaDoc, String> {
             });
         }
     }
+    // ---- design rules
+    let drc = root.get("DRCRULE").and_then(|d| d.get("Default"));
+    let getf = |k: &str, d: f64| drc.and_then(|r| r.get(k)).and_then(|v| v.as_f64()).unwrap_or(d);
+    let (track_w, clear, via_d) = (getf("trackWidth", 1.0), getf("clearance", 0.6) + CLEARANCE_MARGIN, getf("viaHoleDiameter", 2.4));
+    let mut special: Vec<(String, f64, f64)> = vec![];
+    if let Some(sn) = root.get("routerRule").and_then(|r| r.get("specialNets")).and_then(|s| s.as_array()) {
+        for e in sn {
+            let name = e.get("net").and_then(|n| n.as_str()).unwrap_or("");
+            let w = e.get("width").and_then(|v| v.as_str()).and_then(length_px).unwrap_or(track_w);
+            let c = e.get("clearance").and_then(|v| v.as_str()).and_then(length_px).map_or(clear, |c| c + CLEARANCE_MARGIN);
+            special.push((name.to_string(), w, c));
+        }
+    }
+    finish(
+        Collected {
+            notes, pads, holes, outline, tracks, vias, strokes, regions, counts, copper, areas, ids, other_outline,
+            track_w, clear, via_d, special,
+        },
+        root,
+        parts_info,
+        None,
+    )
+}
+
+/// Everything a source format has to tell the DSN writer, in EasyEDA Standard conventions: units
+/// of 10 mil, y pointing down.
+pub(crate) struct Collected {
+    pub notes: Vec<String>,
+    pub pads: Vec<Pad>,
+    /// mounting holes: x, y, radius
+    pub holes: Vec<(f64, f64, f64)>,
+    /// board outline pieces (chained into one polygon)
+    pub outline: Vec<Vec<(f64, f64)>>,
+    /// width, layer, net, points
+    pub tracks: Vec<(f64, String, String, Vec<(f64, f64)>)>,
+    /// x, y, diameter, net
+    pub vias: Vec<(f64, f64, f64, String)>,
+    pub strokes: Vec<Stroke>,
+    pub regions: Vec<Region>,
+    /// vias in footprints, solid regions/rects, arcs/circles, texts, copper areas, tracks in footprints
+    pub counts: [usize; 6],
+    /// copper layer names: top, bottom, then the inner layers
+    pub copper: Vec<String>,
+    /// (net, layer) of every copper area already in the document
+    pub areas: HashSet<(String, String)>,
+    pub ids: HashSet<String>,
+    pub other_outline: usize,
+    pub track_w: f64,
+    /// clearance including the safety margin
+    pub clear: f64,
+    pub via_d: f64,
+    /// net class overrides: net, width, clearance (margin included)
+    pub special: Vec<(String, f64, f64)>,
+}
+
+pub(crate) fn finish(
+    c: Collected,
+    root: Value,
+    parts_info: Vec<PartInfo>,
+    pro: Option<crate::easyeda_pro::ProDoc>,
+) -> Result<EasyedaDoc, String> {
+    let Collected {
+        mut notes, pads, holes, outline, tracks, vias, strokes, regions, counts, copper, areas, ids, other_outline,
+        track_w, clear, via_d, special,
+    } = c;
+
     if other_outline > 0 {
         notes.push(format!("{other_outline} arc/circle/region object(s) on the board-outline layer were ignored"));
     }
@@ -824,11 +894,6 @@ pub fn load(text: &str) -> Result<EasyedaDoc, String> {
 
     // ---- copper layers
     let layers: Vec<String> = copper.clone();
-
-    // ---- rules
-    let drc = root.get("DRCRULE").and_then(|d| d.get("Default"));
-    let getf = |k: &str, d: f64| drc.and_then(|r| r.get(k)).and_then(|v| v.as_f64()).unwrap_or(d);
-    let (track_w, clear, via_d) = (getf("trackWidth", 1.0), getf("clearance", 0.6) + CLEARANCE_MARGIN, getf("viaHoleDiameter", 2.4));
 
     // ---- DSN text
     let mut o = String::new();
@@ -957,23 +1022,26 @@ pub fn load(text: &str) -> Result<EasyedaDoc, String> {
         let pins: Vec<&str> = pin_net.iter().filter(|(m, _)| m == n).map(|(_, p)| p.as_str()).collect();
         let _ = writeln!(o, "    (net {}\n      (pins {})\n    )", quote(n), pins.join(" "));
     }
-    if let Some(sn) = root.get("routerRule").and_then(|r| r.get("specialNets")).and_then(|s| s.as_array()) {
-        for e in sn {
-            let name = e.get("net").and_then(|n| n.as_str()).unwrap_or("");
-            if name.is_empty() || !order.iter().any(|n| n == name) {
-                continue;
-            }
-            let w = e.get("width").and_then(|v| v.as_str()).and_then(length_px).unwrap_or(track_w);
-            let c = e.get("clearance").and_then(|v| v.as_str()).and_then(length_px).map_or(clear, |c| c + CLEARANCE_MARGIN);
-            let _ = writeln!(
-                o,
-                "    (class {} {}\n      (circuit\n        (use_via via0)\n      )\n      (rule\n        (width {})\n        (clearance {})\n      )\n    )",
-                quote(name),
-                quote(name),
-                num(w),
-                num(c)
-            );
+    for (name, w, c) in &special {
+        if name.is_empty() || !order.iter().any(|n| n == name) {
+            continue;
         }
+        let _ = writeln!(
+            o,
+            "    (class {} {}
+      (circuit
+        (use_via via0)
+      )
+      (rule
+        (width {})
+        (clearance {})
+      )
+    )",
+            quote(name),
+            quote(name),
+            num(*w),
+            num(*c)
+        );
     }
     let _ = writeln!(o, "  )");
 
@@ -1027,7 +1095,7 @@ pub fn load(text: &str) -> Result<EasyedaDoc, String> {
     if !areas.is_empty() {
         notes.push(format!("{} existing copper area(s) are kept; nets and layers that already have one get no new fill", areas.len()));
     }
-    Ok(EasyedaDoc { root, parts: parts_info, dsn: o, ox, oy, notes, areas, ids })
+    Ok(EasyedaDoc { root, parts: parts_info, dsn: o, ox, oy, notes, areas, ids, pro })
 }
 
 #[cfg(test)]

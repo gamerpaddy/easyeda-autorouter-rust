@@ -149,6 +149,8 @@ fn layer_label(name: &str) -> String {
         "2" => "Bottom (2)".into(),
         "21" => "Inner 1 (21)".into(),
         "22" => "Inner 2 (22)".into(),
+        // EasyEDA Pro project: inner layers are named In1, In2, ...
+        n if n.starts_with("In") && n[2..].parse::<u32>().is_ok() => format!("Inner {}", &n[2..]),
         _ => name.to_string(),
     }
 }
@@ -211,8 +213,10 @@ struct Issue {
 
 struct RunResult {
     ses: String,
-    /// routed EasyEDA source JSON (when the board was loaded from one)
-    json: Option<String>,
+    /// routed EasyEDA source JSON or Pro project (when the board was loaded from one)
+    json: Option<Vec<u8>>,
+    /// `json` is an EasyEDA Pro project (.epro2), not Standard JSON text
+    pro: bool,
     text: String,
     export_ok: bool,
     options: String,
@@ -416,18 +420,32 @@ impl App {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| path.to_string());
         let path = abs.as_str();
-        let src = match std::fs::read_to_string(path) {
-            Ok(s) => s,
+        let is_pro = path.to_lowercase().ends_with(".epro2");
+        let raw = match std::fs::read(path) {
+            Ok(b) => b,
             Err(e) => {
                 self.msg = format!("cannot read {}: {}", path, e);
                 log_error(&self.msg);
                 return;
             }
         };
-        let is_json = path.to_lowercase().ends_with(".json");
+        // an .epro2 is a ZIP archive, everything else is text
+        let src = if is_pro {
+            String::new()
+        } else {
+            match String::from_utf8(raw.clone()) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.msg = format!("cannot read {}: {}", path, e);
+                    log_error(&self.msg);
+                    return;
+                }
+            }
+        };
+        let is_json = is_pro || path.to_lowercase().ends_with(".json");
         let mut doc: Option<Arc<dsn::easyeda::EasyedaDoc>> = None;
         let parsed = if is_json {
-            match dsn::easyeda::load(&src) {
+            match if is_pro { dsn::easyeda_pro::load(&raw) } else { dsn::easyeda::load(&src) } {
                 Ok(d) => {
                     let b = dsn::parse_dsn(&d.dsn);
                     doc = Some(Arc::new(d));
@@ -771,16 +789,27 @@ impl App {
             for w in &r.pour_warnings {
                 text += &format!("WARNING copper area: {}\n", w);
             }
-            let json = doc.as_ref().map(|d| router::easyeda_out::write_json(&r, d));
+            let pro = doc.as_ref().is_some_and(|d| d.pro.is_some());
+            let json = match doc.as_ref().map(|d| router::easyeda_out::write_output(&r, d)) {
+                Some(Ok(j)) => Some(j),
+                Some(Err(e)) => {
+                    text += &format!("cannot write the EasyEDA file: {e}
+");
+                    None
+                }
+                None => None,
+            };
             if let Some((_, st)) = &json {
                 text += &format!(
-                    "EasyEDA JSON: {} track(s), {} via(s), {} copper area(s) added
+                    "EasyEDA {}: {} track(s), {} via(s), {} copper area(s) added
 ",
+                    if pro { "Pro project" } else { "JSON" },
                     st.tracks, st.vias, st.areas
                 );
             }
             let _ = tx.send(Msg::Done(Box::new(RunResult {
                 json: json.map(|j| j.0),
+                pro,
                 ses: ses::write_ses(&r, &name),
                 text,
                 export_ok,
@@ -850,7 +879,7 @@ impl App {
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         let Some(board) = self.board.clone() else {
-            ui.label("Open a .dsn or an EasyEDA source .json file to begin.");
+            ui.label("Open a .dsn, an EasyEDA source .json or an EasyEDA Pro .epro2 file to begin.");
             return;
         };
         let k = self.k();
@@ -1805,9 +1834,9 @@ impl eframe::App for App {
 
         egui::Panel::top("top").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                if ui.button("📂 Open DSN / EasyEDA JSON…").clicked() {
+                if ui.button("📂 Open DSN / EasyEDA…").clicked() {
                     if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("Specctra DSN or EasyEDA source", &["dsn", "json"])
+                        .add_filter("Specctra DSN, EasyEDA source or EasyEDA Pro project", &["dsn", "json", "epro2"])
                         .pick_file()
                     {
                         let p = p.to_string_lossy().to_string();
@@ -1835,19 +1864,25 @@ impl eframe::App for App {
                 }
                 let can_save = self.result.as_ref().is_some_and(|r| r.export_ok);
                 if self.result.as_ref().is_some_and(|r| r.json.is_some()) {
+                    let pro = self.result.as_ref().is_some_and(|r| r.pro);
                     if ui
-                        .add_enabled(can_save, egui::Button::new("💾 Save EasyEDA JSON…"))
-                        .on_hover_text("The loaded EasyEDA file plus routed tracks, vias and copper areas. Open it in EasyEDA with File > Open > EasyEDA source.")
+                        .add_enabled(can_save, egui::Button::new(if pro { "💾 Save EasyEDA Pro project…" } else { "💾 Save EasyEDA JSON…" }))
+                        .on_hover_text(if pro {
+                            "The loaded EasyEDA Pro project plus routed tracks, vias and copper pours. Open it in EasyEDA Pro."
+                        } else {
+                            "The loaded EasyEDA file plus routed tracks, vias and copper areas. Open it in EasyEDA with File > Open > EasyEDA source."
+                        })
                         .clicked()
                     {
+                        let ext = if pro { "epro2" } else { "json" };
                         let stem = std::path::Path::new(&self.path)
                             .file_stem()
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or("out".into());
                         if let (Some(p), Some(r)) = (
                             rfd::FileDialog::new()
-                                .set_file_name(format!("{}-routed.json", stem))
-                                .add_filter("EasyEDA source", &["json"])
+                                .set_file_name(format!("{}-routed.{}", stem, ext))
+                                .add_filter(if pro { "EasyEDA Pro project" } else { "EasyEDA source" }, &[ext])
                                 .save_file(),
                             &self.result,
                         ) {
