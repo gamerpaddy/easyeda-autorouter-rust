@@ -59,7 +59,7 @@ Measured on an Intel Core i7-13700KF, release build, full run including clean-up
 | ADAU1452 DSP board | 81 x 80 mm | 4 | 85 | 219 | 24.6 s | all routed, 0 clearance errors |
 | ESP32-S3 module board | 31 x 31 mm | 4 | 18 | 86 | 7.9 s | all routed, 0 clearance errors |
 
-Independent nets are routed in parallel on copies of the board state. The result does not depend on how many cores you have.
+Independent nets and repair trials run in parallel on the CPU. The router sizes the worker pool to the available logical cores and the memory needed for the board grid. `AR_THREADS` can lower the worker count.
 
 ## Workflow
 
@@ -120,6 +120,10 @@ The settings of every run are saved next to the result as `board-routed.options.
 ## How it works
 
 The board is turned into a routing grid. Each net is routed with an A* search over all layers, with costs for vias, wrong layers and crossing other nets' areas. If a net does not fit, the nets in its way are ripped up and routed again, followed by regional repairs and, as a last step, a restart with the failing nets first. After routing, traces are smoothed and centred on pads, vias are merged where they would overlap, and the copper areas are traced from the free space of each layer with edges shared between neighbours. A separate DRC pass measures every clearance and checks that each net is connected.
+
+Open signal connections also get adaptive local searches at half and quarter of the main grid spacing, including during regional repairs. The search window grows to allow detours, with limits on memory and search work. Accepted routes retain their finer coordinates and must pass geometric clearance and connectivity checks; trace widths, via sizes and layer restrictions are preserved.
+
+When nudging is enabled, the preview identifies each attempted move and shows the pads at their trial positions. Rejected moves restore the best layout. Candidates favour small movements and try different nearby parts; a move is kept only if it improves the result without increasing clearance errors.
 
 ## Build
 

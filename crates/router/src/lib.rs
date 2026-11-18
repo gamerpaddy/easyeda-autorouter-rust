@@ -1,4 +1,5 @@
 pub mod drc;
+mod adaptive;
 pub mod easyeda_out;
 pub mod engine;
 pub mod geom;

@@ -31,6 +31,9 @@ pub struct Snapshot {
     /// copper areas that will be exported (net, layer, outline)
     #[serde(default)]
     pub pours: Vec<(usize, usize, Vec<(f64, f64)>)>,
+    /// Actual pad centres for a moved layout; absent in older snapshots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pin_positions: Vec<(String, (f64, f64))>,
 }
 
 impl Snapshot {
@@ -67,6 +70,9 @@ impl Snapshot {
             routed: r.connection_count() - r.unrouted_count(),
             unrouted,
             pours: r.fill_polys.clone(),
+            pin_positions: if r.part_moves.is_empty() { vec![] } else {
+                r.pins.iter().map(|p| (p.name.clone(), p.c)).collect()
+            },
         }
     }
 }

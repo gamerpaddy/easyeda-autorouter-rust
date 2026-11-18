@@ -1,5 +1,5 @@
 //! Last resort for connections that stay open: nudge small passives a little (at most a few part
-//! widths) to open a path, then route the whole board again. Off by default. Only small surface
+//! widths) to open a path, then repair the affected routes. Off by default. Only small surface
 //! mount parts move: no ICs, no through-hole parts, no connectors, switches or oscillators, and
 //! no part that already has wiring attached.
 
@@ -97,50 +97,82 @@ pub struct Solved {
 
 struct Run {
     router: Router,
+    routes: SavedRoutes,
     report: drc::DrcReport,
     fail: usize,
     violations: usize,
 }
 
-fn run_once(board: &Board, parts: &[PartSpec], cfg: &Config, skip: &[(String, String)], moves: &[(usize, f64, f64)]) -> Run {
+fn run_once(board: &Board, parts: &[PartSpec], cfg: &Config, skip: &[(String, String)], moves: &[(usize, f64, f64)], previous: Option<&Run>) -> Run {
     let b = moved_board(board, parts, moves);
     let mut r = Router::new(&b, cfg.clone());
     r.pour_skip = skip.to_vec();
-    r.route_all();
-    r.refine();
-    r.finish();
     r.part_moves = moves.to_vec();
+    if let Some(previous) = previous {
+        let moved: Vec<_> = r.pins.iter().zip(&previous.router.pins)
+            .filter(|(a, b)| a.c != b.c && a.net >= 0)
+            .map(|(p, _)| p.net as usize).collect();
+        r.repair_after_move(&previous.routes, &moved);
+    } else {
+        r.route_all();
+        r.refine();
+    }
+    let routes = if cfg.nudge_parts { r.save_routes() } else { vec![] };
+    r.finish();
     let report = drc::check(&r);
     let fail = r.unrouted_count().max(report.open_nets.len());
     let violations = report.clearance_violations.len();
-    Run { router: r, report, fail, violations }
+    Run { router: r, routes, report, fail, violations }
 }
 
 /// Route the board; with `cfg.nudge_parts` and connections left open, move small parts and try
 /// again, keeping every move that helps.
 pub fn solve(board: &Board, cfg: Config, parts: &[PartSpec], pour_skip: &[(String, String)]) -> Solved {
-    let mut best = run_once(board, parts, &cfg, pour_skip, &[]);
+    let started = std::time::Instant::now();
+    let mut best = run_once(board, parts, &cfg, pour_skip, &[], None);
     let mut moves: Vec<(usize, f64, f64)> = vec![];
     let mut log: Vec<String> = vec![];
     if !cfg.nudge_parts || parts.is_empty() || board.components.len() != 1 {
         return Solved { router: best.router, moves, log };
     }
     let mut tried: HashSet<(usize, i64, i64)> = HashSet::new();
+    let mut tried_parts = HashSet::new();
     let mut attempts = 0;
     while best.fail > 0 && attempts < cfg.nudge_attempts && !best.router.cancelled() {
         let cands = candidates(&best, board, parts, &cfg, &moves);
-        let Some(c) = cands.into_iter().find(|c| !tried.contains(&(c.part, (c.dx * 1000.0).round() as i64, (c.dy * 1000.0).round() as i64))) else {
+        let mut available: Vec<_> = cands.into_iter().filter(|c| !tried.contains(&(c.part, (c.dx * 1000.0).round() as i64, (c.dy * 1000.0).round() as i64))).collect();
+        // Do not spend the entire attempt budget on several distant positions of
+        // the same part while other parts along the blocked escape are untried.
+        let candidate = available.iter().position(|c| !tried_parts.contains(&c.part)).unwrap_or(0);
+        let c = if available.is_empty() {
             log.push("no further position to try for the parts around the open connections".into());
+            best.router.snapshot("Nudging: no legal movable part near the remaining connections");
             break;
-        };
+        } else { available.remove(candidate) };
         attempts += 1;
+        tried_parts.insert(c.part);
         let key = (c.part, (c.dx * 1000.0).round() as i64, (c.dy * 1000.0).round() as i64);
         tried.insert(key);
         let trial_moves = merge(&moves, c.part, c.dx, c.dy);
         let unit = best.router.unit_mm;
-        let run = run_once(board, parts, &cfg, pour_skip, &trial_moves);
-        let better = (run.fail, run.violations) < (best.fail, best.violations);
-        log.push(format!(
+        let label = format!("Nudge {}/{}: {} by {:.2} mm", attempts, cfg.nudge_attempts,
+            parts[c.part].name, dist((0.0, 0.0), (c.dx, c.dy)) * unit);
+        best.router.snapshot(&label);
+        if cfg.verbose { eprintln!("{label}"); }
+        let mut trial_cfg = cfg.clone();
+        if let Some(cb) = cfg.on_snapshot.clone() {
+            trial_cfg.on_snapshot = Some(std::sync::Arc::new(move |mut snap| {
+                snap.label = format!("{label}: {}", snap.label);
+                cb(snap);
+            }));
+        }
+        if let Some(dir) = &cfg.snapshot_dir {
+            trial_cfg.snapshot_dir = Some(dir.join(format!("nudge-{attempts}")));
+        }
+        let run = run_once(board, parts, &trial_cfg, pour_skip, &trial_moves, Some(&best));
+        let better = run.violations <= best.violations
+            && (run.fail, run.violations) < (best.fail, best.violations);
+        let message = format!(
             "nudge {} by {:.2} mm: open {} -> {}, clearance errors {} -> {}{}",
             parts[c.part].name,
             (c.dx * c.dx + c.dy * c.dy).sqrt() * unit,
@@ -149,12 +181,19 @@ pub fn solve(board: &Board, cfg: Config, parts: &[PartSpec], pour_skip: &[(Strin
             best.violations,
             run.violations,
             if better { "  (kept)" } else { "  (undone)" }
-        ));
+        );
+        if cfg.verbose { eprintln!("{message}"); }
+        log.push(message);
         if better {
             best = run;
+            best.router.cfg.on_snapshot = cfg.on_snapshot.clone();
+            best.router.cfg.snapshot_dir = cfg.snapshot_dir.clone();
             moves = trial_moves;
         }
+        // A rejected trial must not remain visible as if it were the chosen layout.
+        best.router.snapshot(if better { "Nudge kept: improved routing" } else { "Nudge undone: restored best routing" });
     }
+    best.router.t0 = started;
     Solved { router: best.router, moves, log }
 }
 
@@ -270,7 +309,7 @@ fn candidates(run: &Run, board: &Board, parts: &[PartSpec], cfg: &Config, moves:
         let obstacles = others(pi);
         let cur = total(moves, pi);
         let limit = cfg.nudge_max_widths.clamp(0.0, 3.0) * size;
-        let step = (size / 4.0).max(0.2 / unit);
+        let step = (size / 8.0).max(0.1 / unit);
         let nsteps = (limit / step).floor() as i32;
         for s in 1..=nsteps.max(0) {
             for d in 0..8 {
@@ -281,6 +320,13 @@ fn candidates(run: &Run, board: &Board, parts: &[PartSpec], cfg: &Config, moves:
                     continue;
                 }
                 let moved: Vec<Prim> = prims.iter().map(|p| translate(p, dx, dy)).collect();
+                // A large candidate displacement can jump completely over the edge
+                // keepout without intersecting it. Reject destinations off the board.
+                if moved.iter().any(|p| {
+                    let (x0, y0, x1, y1) = p.bb;
+                    [(x0, y0), (x1, y0), (x1, y1), (x0, y1)].iter()
+                        .any(|&q| !point_in_poly(q, &r.boundary))
+                }) { continue; }
                 let mut min_gap = f64::MAX;
                 let mut legal = true;
                 'check: for m in &moved {
@@ -309,7 +355,8 @@ fn candidates(run: &Run, board: &Board, parts: &[PartSpec], cfg: &Config, moves:
                 let away = segs.iter().map(|s| dist_pt_seg(new_centre, s.0, s.1)).fold(f64::MAX, f64::min) - near;
                 // more room around the part helps the part itself; moving away helps a neighbour
                 let room = min_gap.min(2.0 / unit) * unit;
-                let score = if owns_fail { room * 2.0 } else { room + away.max(0.0) * unit } - 0.05 * s as f64;
+                let benefit = if owns_fail { room * 2.0 } else { room + away.max(0.0) * unit };
+                let score = benefit / (1.0 + dist((0.0, 0.0), (dx, dy)) * unit / 0.25);
                 out.push(Candidate { part: pi, dx, dy, score });
             }
         }

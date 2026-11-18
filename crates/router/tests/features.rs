@@ -649,11 +649,20 @@ fn small_parts_are_nudged_only_when_asked_and_only_when_a_route_is_missing() {
     let rep = drc::check(&off.router);
     assert!(!rep.open_nets.is_empty() || off.router.unrouted_count() > 0, "the gap must be blocked without nudging");
     // on: the part is moved out of the gap (at most 3 part sizes) and the board is complete
-    let on = router::nudge::solve(&board, make(true), &parts, &[]);
+    let snapshots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = snapshots.clone();
+    let mut cfg = make(true);
+    cfg.on_snapshot = Some(std::sync::Arc::new(move |s| captured.lock().unwrap().push(s)));
+    let on = router::nudge::solve(&board, cfg, &parts, &[]);
     let rep = drc::check(&on.router);
     assert!(rep.open_nets.is_empty() && on.router.unrouted_count() == 0, "{:?}", on.log);
     assert!(rep.clearance_violations.is_empty(), "{:?}", rep.clearance_violations);
     assert_eq!(on.moves.len(), 1, "{:?}", on.log);
+    let snapshots = snapshots.lock().unwrap();
+    assert!(snapshots.iter().any(|s| s.label.starts_with("Nudge 1/") && !s.pin_positions.is_empty()),
+        "trial progress must include moved pad positions, not only moved traces");
+    assert!(snapshots.last().unwrap().label.starts_with("Nudge kept"));
+    assert!(!snapshots.last().unwrap().pin_positions.is_empty());
     let (_, dx, dy) = on.moves[0];
     let size = 12.0; // two 4-unit pads 4 units apart
     assert!((dx * dx + dy * dy).sqrt() <= 3.0 * size + 1e-6);

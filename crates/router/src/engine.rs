@@ -515,6 +515,7 @@ pub struct Wire {
 }
 
 pub type Cell = (usize, i32, i32);
+pub(crate) type SavedRoutes = Vec<(Routed, Vec<usize>, bool, bool)>;
 
 #[derive(Clone, Default)]
 pub struct Routed {
@@ -2318,11 +2319,9 @@ impl Router {
                     return;
                 }
                 let before = self.unrouted_count();
-                // Trials for different open nets are independent: run a wave of them in parallel
-                // on copies of the current state, then apply the first one (in net order) that
-                // the sequential rules would have accepted. Later results of that wave started
-                // from the old state, so the following wave starts again after the accepted net.
-                if threads > 1 && std::env::var("AR_RESCUE_PAR").is_ok_and(|v| v == "1") /* measured slower: off */ {
+                // Try independent nets and via costs in parallel, even when only one
+                // connection remains. Every candidate starts from the same copper.
+                if threads > 1 && std::env::var("AR_RESCUE_PAR").map_or(true, |v| v != "0") {
                     let mut wave: Vec<usize> = vec![];
                     let mut j = idx;
                     while j < failing.len() && wave.len() < threads {
@@ -2331,9 +2330,19 @@ impl Router {
                         }
                         j += 1;
                     }
-                    if wave.len() >= 2 {
-                        self.snapshot(&format!("Repair {}: exploring alternatives for {} nets in parallel", round + 1, wave.len()));
-                        let results = self.rescue_wave(&wave, round);
+                    let mut trials = Vec::new();
+                    for cost in [round, round + 1, round + 3] {
+                        for &n in &wave {
+                            let variant = (n, cost);
+                            if trials.len() < threads && !trials.iter().any(|&(m, r)| m == n && rescue_via_factor(r) == rescue_via_factor(cost)) {
+                                trials.push(variant);
+                            }
+                        }
+                    }
+                    if trials.len() >= 2 {
+                        self.snapshot(&format!("Repair {}: testing {} alternatives in parallel", round + 1, trials.len()));
+                        let mut results = self.rescue_wave(&trials);
+                        results.sort_by_key(|result| result.1);
                         let mut accepted = None;
                         for (n, open, remaining, saved) in results {
                             if self.cfg.verbose {
@@ -2412,7 +2421,7 @@ impl Router {
     fn rescue_trial(&mut self, n: usize, round: usize) -> (usize, Vec<usize>) {
         let old_events = self.rip_events;
         let preferred_via_cost = self.cfg.via_cost;
-        self.cfg.via_cost *= [1.0, 0.5, 1.0, 0.25][round % 4];
+        self.cfg.via_cost *= rescue_via_factor(round);
         self.rip_events = 0;
         for x in self.nets.iter_mut() {
             x.rip_count = 0;
@@ -2422,7 +2431,7 @@ impl Router {
         let mut guard = 0;
         while let Some(m) = queue.pop_front() {
             guard += 1;
-            if guard > 40 {
+            if guard > 40 || self.cancelled() {
                 break;
             }
             for v in self.route_net(m, true) {
@@ -2436,6 +2445,7 @@ impl Router {
             .filter(|&m| !self.nets[m].unconnected.is_empty() && !self.nets[m].skip)
             .collect();
         for m in open {
+            if self.cancelled() { break; }
             self.rip_net(m);
             self.route_net(m, false);
         }
@@ -2450,17 +2460,17 @@ impl Router {
     /// `rescue_trial` for several nets at once, each on its own copy of the current state.
     /// Returns, in the order of `nets`, (net, open, nets still open, resulting routes).
     #[allow(clippy::type_complexity)]
-    fn rescue_wave(&mut self, nets: &[usize], round: usize) -> Vec<(usize, usize, Vec<usize>, Vec<(Routed, Vec<usize>, bool, bool)>)> {
+    fn rescue_wave(&mut self, trials: &[(usize, usize)]) -> Vec<(usize, usize, Vec<usize>, SavedRoutes)> {
         let mut workers = std::mem::take(&mut self.workers);
-        while workers.len() < nets.len() {
+        while workers.len() < trials.len() {
             workers.push(self.clone());
         }
         let master: &Router = self;
         let out = std::thread::scope(|s| {
             let handles: Vec<_> = workers
                 .iter_mut()
-                .zip(nets.iter().copied())
-                .map(|(w, n)| {
+                .zip(trials.iter().copied())
+                .map(|(w, (n, round))| {
                     s.spawn(move || {
                         w.sync_from(master);
                         let (open, remaining) = w.rescue_trial(n, round);
@@ -2566,6 +2576,9 @@ impl Router {
                     self.rip_net(m);
                     self.route_net(m, false);
                 }
+                // A displaced neighbour can require a sub-grid escape. Evaluate the
+                // repaired area at finer resolution before rejecting the whole trial.
+                self.adaptive_repair();
                 let open = self.unrouted_count();
                 if self.cfg.verbose {
                     eprintln!(
@@ -2682,10 +2695,8 @@ impl Router {
         // around them. Keep the best of the attempts.
         let mut best = self.save_routes();
         let mut best_open = self.unrouted_count();
-        // Local repairs keep routed progress and come first (inside route_pass). When they
-        // cannot close a connection, one restart is always allowed: an open net is worse
-        // than a longer run, and the best attempt is the one that is kept.
-        for attempt in 0..self.cfg.restart_attempts.clamp(1, 3) {
+        // Full restarts are opt-in. Local repairs and component nudges reuse copper.
+        for attempt in 0..self.cfg.restart_attempts.min(3) {
             if best_open == 0 || self.cancelled() || t.elapsed().as_secs_f32() > 150.0 {
                 break;
             }
@@ -2713,6 +2724,7 @@ impl Router {
         }
         self.restore_routes(best);
         self.last_resorts();
+        self.adaptive_repair();
         self.plane_repair();
         self.snapshot("initial routing done");
         if self.cfg.verbose {
@@ -2731,11 +2743,59 @@ impl Router {
         }
     }
 
-    fn save_routes(&self) -> Vec<(Routed, Vec<usize>, bool, bool)> {
+    pub(crate) fn save_routes(&self) -> SavedRoutes {
         self.nets
             .iter()
             .map(|x| (x.r.clone(), x.unconnected.clone(), x.coupled, x.guided))
             .collect()
+    }
+
+    /// Reuse routing from the same board before finishing, after a placement change.
+    /// Pins and obstacle fields already describe the new layout. Drop moved-pad
+    /// nets, their groups and routes that now fail clearance before stamping copper.
+    pub(crate) fn repair_after_move(&mut self, saved: &SavedRoutes, moved: &[usize]) {
+        let mut affected: HashSet<_> = moved.iter().copied().collect();
+        for (n, (route, _, _, _)) in saved.iter().enumerate() {
+            if !route.dynp.is_empty() && self.prims_conflict(&route.dynp).is_some() {
+                affected.insert(n);
+            }
+        }
+        affected = affected.into_iter().flat_map(|n| self.group_members(n)).collect();
+        let mut reused = 0;
+        for (n, state) in saved.iter().enumerate() {
+            if affected.contains(&n) { continue; }
+            self.stamp_dyn(&state.0.dynp, 1);
+            reused += usize::from(!state.0.dynp.is_empty());
+            let net = &mut self.nets[n];
+            net.r = state.0.clone();
+            net.unconnected = state.1.clone();
+            net.coupled = state.2;
+            net.guided = state.3;
+        }
+        self.snapshot(&format!("Reused {reused} routed nets after moving the part"));
+        if self.cfg.verbose {
+            eprintln!("nudge repair: reused {reused} routed nets, {} connections to repair", self.unrouted_count());
+        }
+        // Give the original failing nets the first chance at the space just freed.
+        let mut open: Vec<_> = (0..self.nets.len()).filter(|&n| !self.nets[n].unconnected.is_empty()).collect();
+        open.sort_by_key(|&n| saved[n].1.is_empty());
+        for n in open {
+            if self.cancelled() { return; }
+            if !self.nets[n].unconnected.is_empty() {
+                let before = self.unrouted_count();
+                let checkpoint = self.save_routes();
+                self.rip_net(n);
+                self.route_net(n, false);
+                if self.unrouted_count() >= before {
+                    self.restore_routes(checkpoint);
+                }
+            }
+        }
+        self.adaptive_repair();
+        self.regional_rescue();
+        self.last_resorts();
+        self.adaptive_repair();
+        self.plane_repair();
     }
 
     fn reset_routes(&mut self) {
@@ -2838,6 +2898,8 @@ impl Router {
             eprintln!("speculative routing: {} tried, {} used, {} not fully connected, {} conflicted", self.spec_stats[0], self.spec_stats[1], self.spec_stats[2], self.spec_stats[3]);
             eprintln!("phase search kinds (window, full, rip-up, thin): {:?}", self.t_cat);
         }
+        // Resolve sub-grid escapes before repeatedly displacing other nets.
+        self.adaptive_repair();
         // retry nets that still have unrouted connections
         for _round in 0..2 {
             if self.cancelled() {
@@ -2981,6 +3043,9 @@ impl Router {
 
 /// How far ahead in the queue a wave looks for nets that do not get in each other's way.
 const WAVE_LOOKAHEAD: usize = 48;
+fn rescue_via_factor(round: usize) -> f32 {
+    [1.0, 0.5, 1.0, 0.25][round % 4]
+}
 /// Nets closer than this (DSN units) are not routed in the same wave.
 const WAVE_MARGIN: f64 = 12.0;
 
@@ -3003,6 +3068,16 @@ pub(crate) struct Spec {
 impl Clone for Router {
     /// A full copy for use as a worker (no GPU context, no snapshot output, no workers of its own).
     fn clone(&self) -> Router {
+        self.copy_for_grid(self.grid.clone(), self.fields.clone(), self.congestion.clone(),
+            self.plane_id.clone(), self.crowd.clone())
+    }
+}
+
+impl Router {
+    /// Also used for local refinement: do not first clone the entire board's
+    /// obstacle arrays merely to throw them away for a small search window.
+    pub(crate) fn copy_for_grid(&self, grid: Grid, fields: Vec<Field>, congestion: Vec<u16>,
+        plane_id: Vec<Vec<u8>>, crowd: Vec<u8>) -> Router {
         let mut cfg = self.cfg.clone();
         cfg.on_snapshot = None;
         cfg.snapshot_dir = None;
@@ -3010,11 +3085,11 @@ impl Clone for Router {
         Router {
             ground_fill_length: self.ground_fill_length,
             cfg,
-            grid: self.grid.clone(),
+            grid,
             layer_names: self.layer_names.clone(),
             excl: self.excl.clone(),
-            fields: self.fields.clone(),
-            congestion: self.congestion.clone(),
+            fields,
+            congestion,
             nets: self.nets.clone(),
             pins: self.pins.clone(),
             fixed: self.fixed.clone(),
@@ -3058,11 +3133,11 @@ impl Clone for Router {
             boundary: self.boundary.clone(),
             planes: self.planes.clone(),
             bundles: self.bundles.clone(),
-            plane_id: self.plane_id.clone(),
+            plane_id,
             cur_net: usize::MAX,
             cur_land: false,
             route_rank: self.route_rank.clone(),
-            crowd: self.crowd.clone(),
+            crowd,
         }
     }
 }
@@ -3070,11 +3145,16 @@ impl Clone for Router {
 impl Router {
     /// Worker threads for speculative routing (`AR_THREADS` overrides; 1 = off).
     pub(crate) fn spec_threads(&self) -> usize {
-        std::env::var("AR_THREADS")
+        let requested = std::env::var("AR_THREADS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(8) // fixed: the wave size shapes the result, so it must not depend on the machine
-            .max(1)
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+            .max(1);
+        // Each worker owns dense obstacle fields and may allocate A* scratch.
+        let cells = self.grid.n().saturating_mul(self.grid.nl);
+        let bytes = cells.saturating_mul(self.fields.len().saturating_mul(6) + 18);
+        let memory_limited = (4usize * (1 << 29) / bytes.max(1)).saturating_mul(2).max(1);
+        requested.min(memory_limited)
     }
 
     /// Bounding box of a net's pins, grown by `WAVE_MARGIN`.
@@ -3139,10 +3219,15 @@ impl Router {
 
     /// Bring a worker up to the state of `m` (only what routing changes).
     fn sync_from(&mut self, m: &Router) {
-        for (a, b) in self.fields.iter_mut().zip(&m.fields) {
-            a.cnt.clone_from(&b.cnt);
-            a.mask.clone_from(&b.mask);
-            a.col.clone_from(&b.col);
+        // Worker searches restore fixed stamps before returning. Bring only the
+        // changed routes across, avoiding copies of entire dense obstacle grids.
+        let grid = &self.grid;
+        for (old, new) in self.nets.iter().zip(&m.nets) {
+            if old.r.dynp == new.r.dynp { continue; }
+            for field in &mut self.fields {
+                for p in &old.r.dynp { field.stamp(grid, p, -1, true); }
+                for p in &new.r.dynp { field.stamp(grid, p, 1, true); }
+            }
         }
         self.congestion.clone_from(&m.congestion);
         self.nets.clone_from(&m.nets);

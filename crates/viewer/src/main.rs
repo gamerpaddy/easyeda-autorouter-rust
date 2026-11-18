@@ -193,9 +193,18 @@ fn net_picker(ui: &mut egui::Ui, id: egui::Id, filter: &mut String, names: &[Str
 }
 
 struct Pad {
+    name: String,
+    center: (f64, f64),
     layer: usize,
     net: i32,
     shape: AbsShape,
+}
+
+impl Pad {
+    fn offset(&self, positions: &HashMap<&str, (f64, f64)>) -> (f64, f64) {
+        positions.get(self.name.as_str()).map_or((0.0, 0.0), |p|
+            (p.0 - self.center.0, p.1 - self.center.1))
+    }
 }
 
 enum Msg {
@@ -295,6 +304,10 @@ struct App {
     fitted: bool,
     sel_net: Option<usize>,
     filter: String,
+    bulk_net_source: Option<usize>,
+    bulk_net_values: [f64; 2],
+    bulk_net_fields: [bool; 2],
+    bulk_net_matching: bool,
     layer_net_filter: HashMap<usize, String>,
     show_pads: bool,
     show_airwires: bool,
@@ -347,6 +360,8 @@ fn pads_of(board: &Board) -> (Vec<Pad>, HashMap<String, (f64, f64)>) {
         pos.insert(k.clone(), (ap.x, ap.y));
         for (l, sh) in &ap.shapes {
             pads.push(Pad {
+                name: k.clone(),
+                center: (ap.x, ap.y),
                 layer: *l,
                 net: pin_net.get(k).copied().unwrap_or(-1),
                 shape: sh.clone(),
@@ -406,6 +421,10 @@ impl App {
             fitted: false,
             sel_net: None,
             filter: String::new(),
+            bulk_net_source: None,
+            bulk_net_values: [0.0; 2],
+            bulk_net_fields: [true; 2],
+            bulk_net_matching: false,
             layer_net_filter: HashMap::new(),
             show_pads: st.show_pads,
             show_planes: st.show_planes,
@@ -469,6 +488,8 @@ impl App {
             }
         };
         let (pads, pos) = pads_of(&board);
+        self.bulk_net_source = None;
+        self.bulk_net_values = [0.0; 2];
         // exclusive defaults: power-type layers
         self.cfg.exclusive = board
             .layers
@@ -1227,7 +1248,7 @@ impl App {
                     .on_hover_text("Tried after jumps: a via inside a pad of the open net itself. Can cost extra at the fabricator (plugged or filled vias).");
                 if json_mode {
                     ui.checkbox(&mut self.cfg.nudge_parts, "Nudge small parts, then route again")
-                        .on_hover_text("Tried last: small passives and other small SMD parts near the missing connection are moved a little and the whole board is routed again. Moves that do not help are undone. Never ICs, through-hole parts, connectors, switches or oscillators, and never a part that already has wiring. The moved parts are saved in the EasyEDA JSON. Off by default.");
+                        .on_hover_text("Tried last: small passives and other small SMD parts near the missing connection are moved a little. The router keeps existing routes where possible and repairs the affected nets. Moves that do not help are undone. Never ICs, through-hole parts, connectors, switches or oscillators, and never a part that already has wiring. The moved parts are saved in the EasyEDA JSON. Off by default.");
                     ui.add_enabled_ui(self.cfg.nudge_parts, |ui| {
                         ui.horizontal(|ui| {
                             ui.label("Move a part at most");
@@ -1247,6 +1268,68 @@ impl App {
                 });
             }
             egui::CollapsingHeader::new("Nets").default_open(true).show(ui, |ui| {
+                egui::CollapsingHeader::new("Apply width / clearance to multiple nets").show(ui, |ui| {
+                    // Capture every current value before applying either field. In matching mode,
+                    // width and clearance each select their own set of matching nets.
+                    let values: Vec<[f64; 2]> = board.nets.iter().enumerate().map(|(i, n)| {
+                        let ov = self.cfg.net_overrides.get(&n.name);
+                        let (w, c) = self.preview.as_ref().map_or(
+                            (board.rule_width, board.rule_clear),
+                            |p| (p.class_width[i], p.class_clearance[i]),
+                        );
+                        [ov.and_then(|o| o.width).unwrap_or(w), ov.and_then(|o| o.clearance).unwrap_or(c)]
+                    }).collect();
+                    if self.bulk_net_source != self.sel_net || self.bulk_net_values[0] == 0.0 {
+                        self.bulk_net_source = self.sel_net;
+                        self.bulk_net_values = self.sel_net.and_then(|i| values.get(i).copied())
+                            .or_else(|| values.first().copied()).unwrap_or([1.0, 0.6]);
+                    }
+                    for (field, label) in ["Width", "Clearance"].iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.bulk_net_fields[field], *label);
+                            ui.add_enabled_ui(self.bulk_net_fields[field], |ui| {
+                                dv(ui, &mut self.bulk_net_values[field], k,
+                                    if field == 0 { 0.0001 } else { 0.0 }, 100.0, 0.01, ul);
+                            });
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.bulk_net_matching, false, "All nets");
+                        ui.selectable_value(&mut self.bulk_net_matching, true, "All with same value");
+                    });
+                    let reference = self.sel_net.and_then(|i| values.get(i).copied());
+                    if self.bulk_net_matching {
+                        if let Some(i) = self.sel_net.filter(|&i| i < values.len()) {
+                            ui.label(format!("Match {}: width {:.4} {}, clearance {:.4} {}",
+                                board.nets[i].name, values[i][0] * k, ul, values[i][1] * k, ul));
+                        } else {
+                            ui.label("Click a net name below to choose the values to match.");
+                        }
+                        ui.small("Each checked field matches its own current value, including file defaults.");
+                    }
+                    ui.small("Includes nets hidden by search. Design-rule minimums still apply.");
+                    let enabled = !values.is_empty() && self.bulk_net_fields.iter().any(|&v| v)
+                        && (!self.bulk_net_matching || reference.is_some());
+                    if ui.add_enabled(enabled, egui::Button::new("Apply to nets")).clicked() {
+                        let mut changed = 0;
+                        for (i, net) in board.nets.iter().enumerate() {
+                            let mut touched = false;
+                            for field in 0..2 {
+                                let matches = !self.bulk_net_matching || reference.is_some_and(|r|
+                                    (values[i][field] - r[field]).abs() <= 1e-9 * r[field].abs().max(1.0));
+                                if self.bulk_net_fields[field] && matches {
+                                    let ov = self.cfg.net_overrides.entry(net.name.clone()).or_default();
+                                    if field == 0 { ov.width = Some(self.bulk_net_values[field]); }
+                                    else { ov.clearance = Some(self.bulk_net_values[field]); }
+                                    touched = true;
+                                }
+                            }
+                            changed += usize::from(touched);
+                        }
+                        self.dirty_preview = true;
+                        self.msg = format!("Applied net dimensions to {changed} nets");
+                    }
+                });
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("Search nets (for example GND)"));
                     if ui.small_button("all").on_hover_text("Route every net again (clears all the \"route\" unticks)").clicked() {
@@ -1555,18 +1638,21 @@ impl App {
                 }
             }
         }
+        let moved_positions: HashMap<&str, (f64, f64)> = self.snaps.get(self.cur).into_iter()
+            .flat_map(|s| s.pin_positions.iter().map(|(name, p)| (name.as_str(), *p))).collect();
         // Pads are never hidden: those on layers that are not shown stay as faint outlines.
         if self.show_pads {
             for p in &self.pads {
+                let (dx, dy) = p.offset(&moved_positions);
                 let on = shown(p.layer);
                 let c = col(p.layer, if dim(p.net) { 30 } else if on { 110 } else { 45 });
                 let edge = Stroke::new(1.0, col(p.layer, if on { 160 } else { 110 }));
                 match &p.shape {
                     AbsShape::Circle { cx, cy, r } => {
-                        painter.circle(tr(*cx, *cy), *r as f32 * scale, c, edge);
+                        painter.circle(tr(*cx + dx, *cy + dy), *r as f32 * scale, c, edge);
                     }
                     AbsShape::Poly(pts) => {
-                        let v: Vec<Pos2> = pts.iter().map(|&(x, y)| tr(x, y)).collect();
+                        let v: Vec<Pos2> = pts.iter().map(|&(x, y)| tr(x + dx, y + dy)).collect();
                         painter.add(egui::Shape::convex_polygon(v, c, edge));
                     }
                 }
@@ -1716,7 +1802,8 @@ impl App {
                         )
                     }
                 };
-                label(p.net as usize, center, size as f32 * scale);
+                let (dx, dy) = p.offset(&moved_positions);
+                label(p.net as usize, (center.0 + dx, center.1 + dy), size as f32 * scale);
             }
         }
         let pre = self
@@ -1759,11 +1846,14 @@ impl App {
                 Some(s) => {
                     for (net, pin) in &s.unrouted {
                         if let (Some(a), Some(first)) = (
-                            self.pin_pos.get(pin),
+                            moved_positions.get(pin.as_str()).or_else(|| self.pin_pos.get(pin)),
                             board.nets[*net]
                                 .pins
                                 .first()
-                                .and_then(|p| self.pin_pos.get(&format!("{}-{}", p.comp, p.pin))),
+                                .and_then(|p| {
+                                    let name = format!("{}-{}", p.comp, p.pin);
+                                    moved_positions.get(name.as_str()).or_else(|| self.pin_pos.get(&name))
+                                }),
                         ) {
                             painter.line_segment([tr(a.0, a.1), tr(first.0, first.1)], white);
                         }
@@ -2107,20 +2197,23 @@ fn to_svg(board: &Board, pads: &[Pad], pv: &Preview, s: Option<&Snapshot>) -> St
             .collect();
         let _ = writeln!(o, "<polygon points='{}' fill='{}' fill-opacity='0.08' stroke='{}' stroke-opacity='0.4' stroke-width='0.3'/>", pts.join(" "), hex(pl.layer), hex(pl.layer));
     }
+    let moved_positions: HashMap<&str, (f64, f64)> = s.into_iter()
+        .flat_map(|s| s.pin_positions.iter().map(|(name, p)| (name.as_str(), *p))).collect();
     for p in pads {
+        let (dx, dy) = p.offset(&moved_positions);
         match &p.shape {
             AbsShape::Circle { cx, cy, r } => {
                 let _ = writeln!(
                     o,
                     "<circle cx='{}' cy='{}' r='{}' fill='{}' fill-opacity='0.4'/>",
-                    cx,
-                    -cy,
+                    cx + dx,
+                    -(cy + dy),
                     r,
                     hex(p.layer)
                 );
             }
             AbsShape::Poly(v) => {
-                let pts: Vec<String> = v.iter().map(|&(x, y)| format!("{},{}", x, -y)).collect();
+                let pts: Vec<String> = v.iter().map(|&(x, y)| format!("{},{}", x + dx, -(y + dy))).collect();
                 let _ = writeln!(
                     o,
                     "<polygon points='{}' fill='{}' fill-opacity='0.4'/>",
@@ -2233,7 +2326,7 @@ fn main() -> eframe::Result {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1500.0, 920.0])
-            .with_title("PCB Autorouter"),
+            .with_title(concat!("PCB Autorouter | Built ", env!("AUTOROUTER_BUILD_DATE"))),
         ..Default::default()
     };
     let result = eframe::run_native("autorouter", opts, Box::new(|_cc| Ok(Box::new(app))));

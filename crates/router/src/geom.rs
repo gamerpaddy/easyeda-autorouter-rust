@@ -70,7 +70,7 @@ pub fn seg_seg_dist(a: P, b: P, c: P, d: P) -> f64 {
         .min(dist_pt_seg(d, a, b))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Geo {
     Circle {
         c: P,
@@ -86,7 +86,7 @@ pub enum Geo {
 }
 
 /// A piece of copper on one layer.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Prim {
     pub layer: usize,
     pub geo: Geo,
