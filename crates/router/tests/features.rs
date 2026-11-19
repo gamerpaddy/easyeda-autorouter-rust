@@ -423,7 +423,7 @@ fn wide_tracks_export_without_polygons() {
 #[test]
 fn trace_routing_migrates_old_fill_settings_and_routes_real_copper() {
     let b = smd_board();
-    let mut cfg = Config { verbose: false, write_fill: true, write_polygons: true, add_gnd_planes: true, ..Config::default() };
+    let mut cfg = Config { verbose: false, write_fill: true, write_polygons: true, add_gnd_planes: true, fine_grid: true, ..Config::default() };
     cfg.layers.insert("bottom".into(), router::LayerPlan {
         role: router::LayerRole::Plane, nets: vec!["GND".into()],
     });
@@ -830,4 +830,77 @@ fn existing_tracks_and_vias_are_only_saved_when_asked_for() {
     let s = shapes(&out);
     assert_eq!(st.omitted, 0);
     assert!(s[3].starts_with("TRACK~1~1~B~") && s[4].starts_with("VIA~160~135"), "{s:?}");
+}
+
+/// One copper layer: net W runs from edge to edge, so net A has no way across it.
+fn wall_board() -> dsn::Board {
+    dsn::parse_dsn(
+        r#"(pcb wall (resolution mm 1000)
+      (structure (boundary (path pcb 0 0 0 20 0 20 12 0 12))
+       (layer top (type signal)) (layer bottom (type signal))
+       (grid wire 0.1) (via via0) (rule (width 0.3) (clearance 0.2)))
+      (placement (component img (place U 0 0 front 0)))
+      (library (image img (pin pad 1 10 0.8) (pin pad 2 10 11.2)
+                           (pin pad 3 1 6) (pin pad 4 19 6))
+       (padstack pad (shape (circle top 0.8)) (shape (circle bottom 0.8)))
+       (padstack via0 (shape (circle top 0.6)) (shape (circle bottom 0.6))))
+      (network (net W (pins U-1 U-2)) (net A (pins U-3 U-4))))"#,
+    )
+    .unwrap()
+}
+
+fn single_sided_cfg(jumpers: bool) -> Config {
+    Config { verbose: false, unit_mm: Some(1.0), single_sided: true, jumpers, grid: Some(0.1), ..Config::default() }
+}
+
+#[test]
+fn single_sided_has_no_vias_and_stays_on_one_layer() {
+    let b = wall_board();
+    let mut r = Router::new(&b, single_sided_cfg(false));
+    r.route_all();
+    r.finish();
+    assert_eq!(r.num_vias(), 0);
+    let layers: std::collections::HashSet<usize> =
+        r.nets.iter().flat_map(|n| n.r.wires.iter().filter(|w| !w.fill).map(|w| w.layer)).collect();
+    assert!(layers.len() <= 1, "{layers:?}");
+    // without jumpers one of the two crossing nets stays open
+    assert!(r.unrouted_count() > 0);
+    assert!(r.jumper_list().is_empty());
+}
+
+#[test]
+fn single_sided_jumper_resistor_hops_over_the_wall() {
+    let b = wall_board();
+    let mut r = Router::new(&b, single_sided_cfg(true));
+    r.route_all();
+    r.finish();
+    assert_eq!(r.num_vias(), 0);
+    assert_eq!(r.unrouted_count(), 0, "jumper should close the connection");
+    let rep = drc::check(&r);
+    assert!(rep.clearance_violations.is_empty(), "{:?}", rep.clearance_violations);
+    assert!(rep.open_nets.is_empty(), "{:?}", rep.open_nets);
+    let jl = r.jumper_list();
+    assert_eq!(jl.len(), 1, "exactly one jumper expected");
+    let (_, j) = jl[0];
+    eprintln!("jumper {} at {:?} pads {:?}, wires {:?}", j.size, j.centre(), j.p, r.nets.iter().map(|n| n.r.wires.iter().map(|w| w.pts.clone()).collect::<Vec<_>>()).collect::<Vec<_>>());
+    assert!(["0402", "0603", "0805", "1206"].contains(&j.size.as_str()));
+}
+
+#[test]
+fn full_width_detour_is_preferred_over_narrowing() {
+    // a 2.2 wide gap would need 1.0 + 2 x 0.5 = 2.0: fits at full width through the gap, but the
+    // straight line is blocked; the trace goes around the obstacle without being narrowed
+    let mut b = board();
+    b.nets.remove(0);
+    b.keepouts.push(dsn::Keepout {
+        layer: None,
+        shape: dsn::Shape::Rect { layer: "top".into(), x1: 14.0, y1: 4.0, x2: 16.0, y2: 20.0 },
+        via_only: false,
+        wire_only: false,
+    });
+    let mut r = Router::new(&b, Config { verbose: false, grid: Some(0.25), ..Config::default() });
+    r.route_all();
+    r.finish();
+    assert_eq!(r.unrouted_count(), 0);
+    assert!(r.nets[0].r.wires.iter().all(|w| (w.width - 1.0).abs() < 1e-9), "all pieces keep the full width");
 }

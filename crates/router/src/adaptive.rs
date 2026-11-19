@@ -18,6 +18,12 @@ fn copper_cells(grid: &Grid, prims: &[Prim]) -> Vec<Cell> {
 
 impl Router {
     pub(crate) fn adaptive_repair(&mut self) {
+        let t0 = std::time::Instant::now();
+        self.adaptive_repair_inner();
+        crate::engine::PROF_ADAPTIVE_MS.fetch_add(t0.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn adaptive_repair_inner(&mut self) {
         let failing: Vec<_> = (0..self.nets.len()).filter(|&n|
             !self.nets[n].skip && !self.nets[n].unconnected.is_empty()
                 && self.nets[n].plane.is_none()).collect();

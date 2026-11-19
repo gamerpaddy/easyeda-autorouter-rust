@@ -15,6 +15,8 @@ pub fn octilinear(a: P, b: P) -> Vec<P> {
     }
 }
 
+use std::collections::HashMap;
+
 impl Router {
     fn wire_prims(&self, n: usize, w: &Wire) -> Vec<Prim> {
         w.pts
@@ -483,6 +485,10 @@ impl Router {
         for l in 0..g.nl {
             if self.cancelled() {
                 break;
+            }
+            // single sided: copper areas only on the one copper layer
+            if self.cfg.single_sided && self.excl[l] {
+                continue;
             }
             let nets: Vec<usize> = self
                 .cfg
@@ -1517,7 +1523,7 @@ impl Router {
                 .and_then(|o| o.via_count)
                 .unwrap_or(1)
                 .min(8);
-            if want <= 1 || self.nets[n].skip {
+            if want <= 1 || self.nets[n].skip || self.cfg.single_sided {
                 continue;
             }
             let (vr, clr, width) = (self.nets[n].via_r, self.nets[n].clr, self.nets[n].width);
@@ -1671,6 +1677,9 @@ impl Router {
     /// it touches, and never inside the copper area of another net. Fill areas that end up without
     /// any copper of the net are removed again.
     fn stitch_fill_vias(&mut self) {
+        if self.cfg.single_sided {
+            return;
+        }
         let Some(f) = self.fill_net_index() else { return };
         let nl = self.grid.nl;
         let pitch = self.cfg.stitch_pitch_mm / self.unit_mm.max(1e-12);
@@ -1726,6 +1735,40 @@ impl Router {
                 v
             };
             let q = pitch / 4.0;
+            // Where something is: copper of any net (pads, traces, vias) as seen before any
+            // stitching via exists, in buckets of the search distance.
+            let near = self.cfg.stitch_near_mm / self.unit_mm.max(1e-12);
+            let bucket = near.max(1e-9);
+            let mut stuff: HashMap<(i64, i64), Vec<Prim>> = HashMap::new();
+            if near > 0.0 {
+                let all = self
+                    .pins
+                    .iter()
+                    .flat_map(|p| p.prims.iter())
+                    .chain(self.nets.iter().flat_map(|n| n.pre.dynp.iter().chain(n.r.dynp.iter())))
+                    .filter(|p| !p.fill && !p.trace_only);
+                for pr in all {
+                    for bx in (pr.bb.0 / bucket).floor() as i64..=(pr.bb.2 / bucket).floor() as i64 {
+                        for by in (pr.bb.1 / bucket).floor() as i64..=(pr.bb.3 / bucket).floor() as i64 {
+                            stuff.entry((bx, by)).or_default().push(pr.clone());
+                        }
+                    }
+                }
+            }
+            let something_near = |c: P| -> bool {
+                if near <= 0.0 {
+                    return true;
+                }
+                let (bx, by) = ((c.0 / bucket).floor() as i64, (c.1 / bucket).floor() as i64);
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        if stuff.get(&(bx + dx, by + dy)).is_some_and(|v| v.iter().any(|p| p.dist(c) <= near)) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            };
             for allow_cuts in [false, true] {
                 let mut row = 0;
                 let mut y = y0 + pitch / 2.0;
@@ -1737,7 +1780,7 @@ impl Router {
                             if existing.iter().any(|o| dist(*o, c) < sep) {
                                 break;
                             }
-                            if !point_in_poly(c, &self.boundary) {
+                            if !point_in_poly(c, &self.boundary) || !something_near(c) {
                                 continue;
                             }
                             let pts = rim(c);
@@ -1848,6 +1891,9 @@ impl Router {
                     self.nets[n].clr,
                 ));
             }
+        }
+        for j in &self.nets[n].r.jumpers {
+            prims.extend(j.pads(n as i32, self.nets[n].clr));
         }
         self.nets[n].r.dynp = prims;
     }
@@ -2362,6 +2408,9 @@ impl Router {
 
     /// A clear through via gives the net copper on every layer so a plane/pour can attach.
     fn add_fill_via(&mut self, n: usize) -> bool {
+        if self.cfg.single_sided {
+            return false;
+        }
         let g = self.grid.g;
         let mut cands: Vec<P> = vec![];
         for w in self.nets[n].r.wires.iter().filter(|w| !w.fill) {

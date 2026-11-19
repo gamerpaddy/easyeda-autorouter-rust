@@ -504,12 +504,14 @@ impl Router {
                             vias: vp,
                             tree: vec![],
                             dynp: dp,
+                            jumpers: vec![],
                         };
                         self.nets[q].r = Routed {
                             wires: wq,
                             vias: vq,
                             tree: vec![],
                             dynp: dq,
+                            jumpers: vec![],
                         };
                         for &x in &[p, q] {
                             self.nets[x].unconnected = vec![];

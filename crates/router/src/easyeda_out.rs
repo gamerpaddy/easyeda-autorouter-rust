@@ -13,6 +13,8 @@ pub struct JsonStats {
     pub tracks: usize,
     pub vias: usize,
     pub areas: usize,
+    /// 0 ohm jumper resistors on the board (single sided mode)
+    pub jumpers: usize,
     /// tracks and vias that were on the board before routing and are left out of the saved file
     /// (they are kept with `include_existing`)
     pub omitted: usize,
@@ -88,12 +90,68 @@ pub fn write_json(r: &Router, doc: &EasyedaDoc) -> (String, JsonStats) {
             let (x, y) = doc.to_json_xy(v);
             let dia = 2.0 * n.via_r;
             let mut drill = (r.cfg.rules.min_via_drill_mm / unit).max(0.0);
-            if drill <= 0.0 || drill > dia * 0.8 {
+            // the ring around the hole stays at least 0.1 mm (JLCPCB: diameter >= hole + 0.1)
+            if drill > dia - 0.1 / unit {
+                drill = dia - 0.1 / unit;
+            }
+            if drill <= 0.0 {
                 drill = dia * 0.5;
             }
             add.push(format!("VIA~{}~{}~{}~{}~{}~{}~0", n4(x), n4(y), n4(dia), n.name, n4(drill / 2.0), new_id()));
             stats.vias += 1;
         }
+    }
+    // 0 ohm jumper resistors (single sided boards): a footprint with its two pads on the net
+    for (k, (ni, j)) in r.jumper_list().into_iter().enumerate() {
+        let net = &r.nets[ni].name;
+        let layer = &r.layer_names[j.layer];
+        let (cx, cy) = doc.to_json_xy(j.centre());
+        let vertical = (j.p[0].0 - j.p[1].0).abs() < (j.p[0].1 - j.p[1].1).abs();
+        let rot = if vertical { 90 } else { 0 };
+        let pads = j.pads(ni as i32, 0.0);
+        let (lcsc, mpn) = crate::engine::jumper_part(&j.size).unwrap_or(("", ""));
+        let uid = format!("{:032x}", 0x6a756d7065720000u128 + k as u128);
+        let mut s = format!(
+            "LIB~{}~{}~package`R{}`Value`0Ω`Supplier`LCSC`Supplier Part`{}`Manufacturer Part`{}`JLCPCB Part Class`Basic Part`Contributor`lcsc`~~~{}~1~{}~1~0~~yes~~",
+            n4(cx),
+            n4(cy),
+            j.size,
+            lcsc,
+            mpn,
+            new_id(),
+            uid
+        );
+        for (num, (pad, c)) in pads.iter().zip(j.p.iter()).enumerate() {
+            let (px, py) = doc.to_json_xy(*c);
+            let pts: Vec<String> = match &pad.geo {
+                crate::geom::Geo::Poly(v) => v
+                    .iter()
+                    .map(|&q| {
+                        let (x, y) = doc.to_json_xy(q);
+                        format!("{} {}", n4(x), n4(y))
+                    })
+                    .collect(),
+                _ => vec![],
+            };
+            s += &format!(
+                "#@$PAD~RECT~{}~{}~{}~{}~{}~{}~{}~0~{}~{}~{}~0~~Y~0~-393.7008~0.2000~{},{}",
+                n4(px),
+                n4(py),
+                n4(j.along),
+                n4(j.across),
+                layer,
+                net,
+                num + 1,
+                pts.join(" "),
+                rot,
+                new_id(),
+                n4(px),
+                n4(py)
+            );
+        }
+        let _ = k;
+        add.push(s);
+        stats.jumpers += 1;
     }
     for (net, layer, ring) in &r.fill_polys {
         let name = &r.nets[*net].name;
@@ -173,7 +231,10 @@ pub fn write_epro2(r: &Router, doc: &EasyedaDoc, pro: &ProDoc) -> Result<(Vec<u8
             let dia = 2.0 * n.via_r;
             // at least the hole of the project's via rule
             let mut drill = (r.cfg.rules.min_via_drill_mm / unit).max(pro.via_hole_mil * 0.1);
-            if drill <= 0.0 || drill > dia * 0.8 {
+            if drill > dia - 0.1 / unit {
+                drill = dia - 0.1 / unit;
+            }
+            if drill <= 0.0 {
                 drill = dia * 0.5;
             }
             add.push(NewObject::Via { net: n.name.clone(), at: doc.to_json_xy(v), dia, hole: drill });
@@ -190,8 +251,52 @@ pub fn write_epro2(r: &Router, doc: &EasyedaDoc, pro: &ProDoc) -> Result<(Vec<u8
         add.push(NewObject::Pour { net: name.clone(), layer: lname.clone(), ring: ring.iter().map(|&p| doc.to_json_xy(p)).collect() });
         stats.areas += 1;
     }
+    // Jumper resistors are parts, which this writer cannot add to a Pro project: the tracks run
+    // to their pad places and the parts come from the placement list (`jumper_list_json`).
+    stats.jumpers = r.jumper_list().len();
     let omit: &[usize] = if r.cfg.include_existing { &[] } else { &doc.existing };
     stats.omitted = omit.len();
     let (bytes, _) = pro.save(&add, &r.part_moves, omit)?;
     Ok((bytes, stats))
+}
+
+/// Placement list of the jumper resistors for the CAD: one entry per part with the net, the size
+/// (0603, 0805, 1206), the centre in mm and mil (y up, as EasyEDA Pro shows it), the angle
+/// (0 = pads left and right, 90 = pads above and below), the layer and the pad size in mm.
+pub fn jumper_list_json(r: &Router, doc: &EasyedaDoc) -> Option<String> {
+    let list = r.jumper_list();
+    if list.is_empty() {
+        return None;
+    }
+    let unit = if r.unit_mm > 0.0 { r.unit_mm } else { PX_MM };
+    let items: Vec<Value> = list
+        .iter()
+        .enumerate()
+        .map(|(k, (ni, j))| {
+            let (jx, jy) = doc.to_json_xy(j.centre());
+            let (x_mm, y_mm) = (jx * PX_MM, -jy * PX_MM);
+            let vertical = (j.p[0].0 - j.p[1].0).abs() < (j.p[0].1 - j.p[1].1).abs();
+            let (lcsc, mpn) = crate::engine::jumper_part(&j.size).unwrap_or(("", ""));
+            serde_json::json!({
+                "designator": format!("RJ{}", k + 1),
+                "net": r.nets[*ni].name,
+                "size": j.size,
+                "footprint": format!("R{}", j.size),
+                "value": "0R",
+                "lcsc": lcsc,
+                "manufacturer_part": mpn,
+                "jlcpcb_class": "Basic Part",
+                "layer": r.layer_names[j.layer],
+                "x_mm": (x_mm * 1e4).round() / 1e4,
+                "y_mm": (y_mm * 1e4).round() / 1e4,
+                "x_mil": (x_mm / 0.0254 * 1e3).round() / 1e3,
+                "y_mil": (y_mm / 0.0254 * 1e3).round() / 1e3,
+                "angle": if vertical { 90 } else { 0 },
+                "pad_length_mm": (j.along * unit * 1e3).round() / 1e3,
+                "pad_width_mm": (j.across * unit * 1e3).round() / 1e3,
+                "pad_pitch_mm": (dist(j.p[0], j.p[1]) * unit * 1e3).round() / 1e3,
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&serde_json::json!({ "jumpers": items })).ok()
 }

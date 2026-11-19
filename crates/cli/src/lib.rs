@@ -32,11 +32,22 @@ fn usage() -> ! {
   --skip NET1,NET2       leave these nets unrouted
   --net-width NET=W      override a net's trace width (repeatable)
   --net-clearance NET=C  override a net's clearance (repeatable)
-  --include-existing     also write the existing wiring: into the SES, or (EasyEDA JSON, Pro
-                         project) keep the tracks and vias that were on the board in the saved
-                         file. Without it the saved EasyEDA file holds only the new routing.
+  --include-existing     DSN input: also write the existing wiring into the SES (an EasyEDA JSON /
+                         Pro file always keeps what is on the board and adds the result to it)
   --allow-vias-in-pads   allow new vias to overlap pads (default off)
-  --no-neckdown          disable local 50% width fallback (default on)
+  --no-neckdown          never narrow a trace (default: a trace first keeps its full width and
+                         goes around obstacles; only when that fails it is narrowed to 75%,
+                         50%, then the minimum width, and widened again wherever room allows)
+  --max-detour X         longest detour kept at full width, as a multiple of the straight
+                         distance (+10 mm) (default 3, 0 = any detour before narrowing)
+  --single-sided         one copper layer only: no vias, no via-in-pad, no jumps, no stitching,
+                         copper areas on that layer only. The layer is the one with the most SMD
+                         pads (bottom on a tie); pads only on the other layer stay open
+  --single-layer NAME    like --single-sided, on the named layer
+  --no-jumpers           single sided: no 0 ohm resistors (default: a connection with no path
+                         at all hops over other traces with the smallest 0402/0603/0805/1206 that
+                         fits, as a last resort; the parts are in the output / a .jumpers.json)
+  --jumper-sizes LIST    sizes the router may use, e.g. 0805,1206 (default 0402,0603,0805,1206)
   --allow-plane-cuts     disable protection of imported planes
   --layer NAME=signal:NET,NET  preferred routing layer for assigned nets; short escapes
                          may use other layers, e.g. --layer 21=signal:GND
@@ -50,6 +61,14 @@ fn usage() -> ! {
                          power traces (default off: EasyEDA drops widths, so plain centre
                          lines with the fewest segments are written)
   --unit-mm X            millimetres per DSN unit (default: detected)
+  (the design rules of an imported EasyEDA file are used unless one of the rule switches is given)
+  --rules NAME           design-rule preset: cheapest (JLCPCB 0.127, via 0.45/0.30), economic (default:
+                         0.09, via 0.45/0.20), minimum (0.09, via 0.30/0.20, edge 0.2), relaxed;
+                         single switches below override it
+  --project-via          use the via of the project (the minimum via diameter only raises it);
+                         default: vias are made exactly the minimum via diameter
+  --min-via-drill-mm X   drill written for vias
+  --stitch-near-mm X     stitching vias only within X mm of a pad, trace or via (default 3, 0 = anywhere)
   --min-trace-mm X --min-clearance-mm X --min-via-mm X --min-edge-mm X   global DRC minimums
   --no-drc-minimums      disable the global minimums (default: JLCPCB 4-layer economic)
   --net-vias NET=N       vias side by side at every layer change of a net (repeatable)
@@ -58,7 +77,7 @@ fn usage() -> ! {
   --no-plane-jumps       never use plane / no-routing layers, even for nets that stay open
   --jump-mm X            longest last-resort jump on such a layer (default 5)
   --snapshots DIR        write routing snapshots (viewable in autorouter)
-  --every N   --via-cost C   --refine N   --grid G   --no-pairs   --quiet"
+  --every N   --via-cost C   --refine N   --no-pairs   --quiet"
     );
     let help = std::env::args().any(|a| a == "--help" || a == "-h");
     if !help {
@@ -103,9 +122,15 @@ pub fn run() {
             "--min-trace-mm",
             "--min-clearance-mm",
             "--min-via-mm",
+            "--min-via-drill-mm",
+            "--stitch-near-mm",
+            "--rules",
             "--min-edge-mm",
             "--max-power-width-mm",
             "--pour-reach-mm",
+            "--single-layer",
+            "--jumper-sizes",
+            "--max-detour",
         ]
         .contains(&a.as_str())
             && i + 1 == args.len()
@@ -120,6 +145,19 @@ pub fn run() {
         cfg = serde_json::from_str(&txt).expect("bad options file");
         cfg.verbose = true;
     }
+    if let Some(i) = args.iter().position(|a| a == "--rules") {
+        match router::DrcRules::preset(&args[i + 1]) {
+            Some(r) => cfg.rules = r,
+            None => {
+                eprintln!("unknown rule preset '{}' (cheapest, economic, minimum, relaxed)", args[i + 1]);
+                std::process::exit(2)
+            }
+        }
+    }
+    // rules chosen on the command line or in an options file win over the rules of the file
+    let rules_chosen = args.iter().any(|a| {
+        ["--options", "--rules", "--min-trace-mm", "--min-clearance-mm", "--min-via-mm", "--min-via-drill-mm", "--no-drc-minimums"].contains(&a.as_str())
+    });
     let mut input = None;
     let mut out = None;
     let mut save_opts = None;
@@ -214,6 +252,16 @@ pub fn run() {
                 i += 1;
                 cfg.rules.min_edge_clearance_mm = args[i].parse().unwrap_or_else(|_| usage());
             }
+            "--rules" => i += 1,
+            "--project-via" => cfg.rules.use_min_via = false,
+            "--min-via-drill-mm" => {
+                i += 1;
+                cfg.rules.min_via_drill_mm = args[i].parse().unwrap_or_else(|_| usage());
+            }
+            "--stitch-near-mm" => {
+                i += 1;
+                cfg.stitch_near_mm = args[i].parse().unwrap_or_else(|_| usage());
+            }
             "--no-drc-minimums" => cfg.rules.enabled = false,
             "--net-vias" => {
                 i += 1;
@@ -266,6 +314,21 @@ pub fn run() {
             }
             "--allow-vias-in-pads" => cfg.allow_vias_in_pads = true,
             "--no-neckdown" => cfg.allow_neckdown = false,
+            "--single-sided" => cfg.single_sided = true,
+            "--single-layer" => {
+                i += 1;
+                cfg.single_sided = true;
+                cfg.single_layer = Some(args[i].clone());
+            }
+            "--no-jumpers" => cfg.jumpers = false,
+            "--jumper-sizes" => {
+                i += 1;
+                cfg.jumper_sizes = args[i].split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            }
+            "--max-detour" => {
+                i += 1;
+                cfg.max_detour = args[i].parse().unwrap_or_else(|_| usage());
+            }
             "--allow-plane-cuts" => cfg.protect_planes = false,
             "--include-existing" => cfg.include_existing = true,
             "--snapshots" => {
@@ -299,6 +362,8 @@ pub fn run() {
     let is_pro = input.extension().is_some_and(|e| e.eq_ignore_ascii_case("epro2") || e.eq_ignore_ascii_case("epro"));
     let is_json = is_pro || input.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"));
     if is_json {
+        // an EasyEDA file keeps everything that is on the board; the result adds to it
+        cfg.include_existing = true;
         // EasyEDA keeps track widths and has copper areas
         cfg.keep_track_widths = true;
         cfg.pour_polygons = !no_fills;
@@ -331,6 +396,13 @@ pub fn run() {
         });
         for n in &d.notes {
             println!("note: {n}");
+        }
+        if let (Some(r), false) = (d.rules_mm, rules_chosen) {
+            cfg.apply_file_rules(r);
+            println!(
+                "design rules of the file: trace {:.3} (default width; narrowing floor {:.3}), clearance {:.3}, via {:.3} / hole {:.3} mm",
+                r[0], cfg.rules.min_trace_mm, r[1], r[2], r[3]
+            );
         }
         Some(d)
     } else {
@@ -463,6 +535,21 @@ pub fn run() {
             st.areas,
             if r.outline_stats.1 > 0 { format!(" ({} pour piece(s) skipped)", r.outline_stats.1) } else { String::new() }
         );
+        if st.jumpers > 0 {
+            println!("{} jumper resistor(s) (0 ohm) carry nets over other traces:", st.jumpers);
+            for (ni, j) in r.jumper_list() {
+                let c = j.centre();
+                println!("  {} on net {} at ({:.2}, {:.2}) mm", j.size, r.nets[ni].name, c.0 * r.unit_mm, c.1 * r.unit_mm);
+            }
+            if let Some(list) = router::easyeda_out::jumper_list_json(&r, d) {
+                let f = out.with_extension("jumpers.json");
+                std::fs::write(&f, list).expect("cannot write jumper list");
+                println!("jumper placement list: {}", f.display());
+            }
+            if d.pro.is_some() {
+                println!("note: EasyEDA Pro: the tracks run to the pad places of the jumpers; place the 0 ohm resistors from the list, they close the nets");
+            }
+        }
         if st.omitted > 0 {
             println!(
                 "note: {} existing track(s)/via(s) are not in the saved file (they are shown in the preview only); nets that rely on them are open in that file. Use --include-existing to keep them",

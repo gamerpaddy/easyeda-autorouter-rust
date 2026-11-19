@@ -1006,6 +1006,7 @@ fn build(bytes: Vec<u8>, p: Project, title: String) -> Result<EasyedaDoc, String
             via_d: via * PX,
             special: vec![],
             existing,
+            rules_mm: Some([track * 0.0254, clear * 0.0254, via * 0.0254, hole * 0.0254]),
         },
         Value::Null,
         parts,

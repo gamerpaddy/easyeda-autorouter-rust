@@ -383,6 +383,9 @@ impl App {
             cfg.plane_jump_mm = Config::default().plane_jump_mm;
         }
         cfg.verbose = false;
+        // the routing grid is adaptive and the pair gap is the clearance (DRC): no options
+        cfg.grid = None;
+        cfg.pair_gap = None;
         cfg.net_overrides.clear();
         cfg.layers.clear();
         cfg.group_tolerances.clear();
@@ -534,9 +537,17 @@ impl App {
             self.cfg.exclusive_planes = bs.exclusive_planes;
             self.cfg.unit_mm = bs.unit_mm;
         }
+        // the design rules of the file, not the defaults or the rules of the last board
+        if let Some(r) = doc.as_ref().and_then(|d| d.rules_mm) {
+            self.cfg.apply_file_rules(r);
+        }
         // EasyEDA JSON keeps track widths and can hold copper areas: real widths, real fills
         self.cfg.keep_track_widths = doc.is_some();
         self.cfg.pour_polygons = doc.is_some();
+        // an EasyEDA file keeps everything that is on the board; the result adds to it
+        if doc.is_some() {
+            self.cfg.include_existing = true;
+        }
         if doc.is_some() {
             self.cfg.power_width_max_mm = 0.0;
         }
@@ -827,12 +838,6 @@ impl App {
                     if pro { "Pro project" } else { "JSON" },
                     st.tracks, st.vias, st.areas
                 );
-                if st.omitted > 0 {
-                    text += &format!(
-                        "{} existing track(s)/via(s) are not in the saved file (shown ghosted); nets that rely on them are open in that file. Tick 'Keep the existing tracks and vias in the saved file' to keep them.\n",
-                        st.omitted
-                    );
-                }
             }
             let _ = tx.send(Msg::Done(Box::new(RunResult {
                 json: json.map(|j| j.0),
@@ -965,9 +970,18 @@ impl App {
                     row(ui, "Minimum via drill", &mut r.min_via_drill_mm, "Drill size written for vias in the EasyEDA JSON. The SES has no drill size.");
                     row(ui, "Minimum copper to board edge", &mut r.min_edge_clearance_mm, "Distance kept free between copper and the board outline.");
                 });
-                if ui.button("Reset to JLCPCB 4-layer (economic)").clicked() {
-                    self.cfg.rules = router::DrcRules::default();
-                }
+                ui.checkbox(&mut self.cfg.rules.use_min_via, "Make vias exactly the minimum diameter")
+                    .on_hover_text("On: every via is as wide as the minimum via diameter (nets with a via of their own keep it). Off: the via of the project is used, the minimum only raises it. The SES file names the project's via, so use the EasyEDA JSON or Pro output for the smaller size.");
+                ui.label("Presets");
+                ui.horizontal_wrapped(|ui| {
+                    for (key, text) in router::DrcRules::PRESETS {
+                        if ui.button(key).on_hover_text(text).clicked() {
+                            if let Some(r) = router::DrcRules::preset(key) {
+                                self.cfg.rules = r;
+                            }
+                        }
+                    }
+                });
                 ui.small(format!(
                     "In DSN units: trace {:.3}, clearance {:.3}, via dia {:.3}",
                     self.cfg.rules.min_trace_mm / self.unit_mm,
@@ -1120,10 +1134,32 @@ impl App {
 
                 ui.add_space(4.0);
                 ui.strong("Traces and vias");
+                ui.checkbox(&mut self.cfg.single_sided, "Single sided board (one layer, no vias, no holes)")
+                    .on_hover_text("All traces on one copper layer, no vias, no via-in-pad, no jumps, no stitching vias; copper areas on that layer only. The layer is the one with the most SMD pads (bottom on a tie). Pads that exist only on the other layer stay open.");
+                ui.add_enabled_ui(self.cfg.single_sided, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Layer");
+                        let cur = self.cfg.single_layer.clone().unwrap_or_else(|| "automatic".into());
+                        egui::ComboBox::from_id_salt("single_layer").selected_text(cur).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.cfg.single_layer, None, "automatic");
+                            for l in board.layers.iter().filter(|l| !l.power) {
+                                ui.selectable_value(&mut self.cfg.single_layer, Some(l.name.clone()), l.name.clone());
+                            }
+                        });
+                    });
+                    ui.checkbox(&mut self.cfg.jumpers, "0 ohm resistors as the last resort (0402 to 1206)")
+                        .on_hover_text("A connection that has no path at all hops over the traces in its way with the smallest 0 ohm resistor that fits. The parts are in the saved EasyEDA JSON; a placement list (.jumpers.json) is written next to every result, for EasyEDA Pro projects the parts must be placed from it.");
+                });
                 ui.checkbox(&mut self.cfg.allow_vias_in_pads, "Allow vias inside pads")
                     .on_hover_text("Off: a via never touches a pad. On: vias may sit inside pads, which can cost extra at the fabricator (plugged or filled vias).");
                 ui.checkbox(&mut self.cfg.allow_neckdown, "Narrow a trace where the full width does not fit")
-                    .on_hover_text("Where a trace of the requested width does not fit, it is narrowed to 75%, 50% or 35%, never below the minimum trace width (Design rules). The full width is restored wherever it fits.");
+                    .on_hover_text("Last option. A trace first keeps its full width and goes around obstacles; only when no acceptable path exists it is narrowed to 75%, 50%, then the minimum trace width (Design rules). The full width is restored wherever it fits.");
+                ui.horizontal(|ui| {
+                    ui.label("Longest detour at full width");
+                    ui.add(egui::DragValue::new(&mut self.cfg.max_detour).range(0.0..=20.0).speed(0.1).suffix(" x"));
+                })
+                .response
+                .on_hover_text("A trace may be this many times (plus 10 mm) longer than the straight distance to stay at full width. Longer: it is narrowed instead. 0 = any detour.");
                 ui.horizontal(|ui| {
                     ui.label("Widen power traces up to");
                     ui.add(egui::DragValue::new(&mut self.cfg.power_width_max_mm).range(0.0..=20.0).speed(0.1).suffix(" mm"));
@@ -1136,7 +1172,7 @@ impl App {
                 });
                 ui.small(format!(
                     "One via counts like {:.2} {} of extra trace. Higher: fewer vias and longer detours. Lower: more vias and shorter traces.",
-                    self.cfg.via_cost as f64 * self.cfg.grid.unwrap_or(board.grid_wire.max(0.25)) * k,
+                    self.cfg.via_cost as f64 * self.cfg.grid_for(&board) * k,
                     ul
                 ));
                 ui.horizontal(|ui| {
@@ -1179,6 +1215,13 @@ impl App {
                             })
                             .response
                             .on_hover_text("Distance between the vias that tie the fill areas of different layers together. Vias avoid other nets' areas where they can and cut them only sparingly. 0 = no stitching vias (fill areas without copper of the fill net are then dropped).");
+                            ui.horizontal(|ui| {
+                                ui.label("only within");
+                                ui.add(egui::DragValue::new(&mut self.cfg.stitch_near_mm).range(0.0..=100.0).speed(0.1).suffix(" mm"));
+                                ui.label("of a pad, trace or via");
+                            })
+                            .response
+                            .on_hover_text("Stitching vias are only placed where something is: near a pad, a trace or a via of any net. Empty areas stay free of vias. 0 = everywhere on the grid.");
                         });
                     });
                 } else {
@@ -1188,10 +1231,6 @@ impl App {
                         .on_hover_text("Draws the area a pour of each layer-assigned net would cover as a thin closed trace on its layer. Re-trace it as a copper area in the CAD, then delete the trace.");
                     ui.checkbox(&mut self.cfg.include_existing, "Also write the existing wiring to the SES")
                         .on_hover_text("Existing traces always stay on the board. Off: the SES only holds the new routes.");
-                }
-                if json_mode {
-                    ui.checkbox(&mut self.cfg.include_existing, "Keep the existing tracks and vias in the saved file")
-                        .on_hover_text("The tracks and vias that are already on the board are always shown and routed around. Off: the saved file holds only the new routing, the existing ones are left out (they show ghosted in the preview), so nets that rely on them are open in that file. On: they stay in the saved file.");
                 }
                 ui.checkbox(&mut self.cfg.protect_planes, "Do not cut imported copper areas")
                     .on_hover_text("On: traces avoid the copper areas that are already in the file (a trace may still cross one with a penalty, see Existing areas). Off: they may be cut freely.");
@@ -1204,34 +1243,10 @@ impl App {
                 })
                 .response
                 .on_hover_text("After the first routing the board is re-routed net by net to shorten traces and remove vias. More passes: slightly better, slower. 0 = none.");
-                let mut custom_grid = self.cfg.grid.is_some();
-                ui.horizontal(|ui| {
-                    if ui.checkbox(&mut custom_grid, "Routing grid").on_hover_text("Off: chosen automatically. A finer grid finds tighter routes but is much slower.").changed() {
-                        self.cfg.grid = if custom_grid { Some(board.grid_wire.max(0.25)) } else { None };
-                    }
-                    if let Some(g) = &mut self.cfg.grid {
-                        dv(ui, g, k, 0.01, 10.0, 0.01, ul);
-                    } else {
-                        ui.label(format!("(automatic: {:.4} {})", self.cfg.grid_for(&board) * k, ul))
-                            .on_hover_text("A quarter of trace width + clearance, so neighbouring tracks pack exactly.");
-                    }
-                });
-
                 ui.add_space(6.0);
                 ui.strong("Differential pairs");
                 ui.checkbox(&mut self.cfg.pairs, "Route differential pairs together (+/-, _P/_N, DP/DN)")
                     .on_hover_text("Nets whose names form a pair are routed side by side. Groups you make in the Nets list are routed together too.");
-                let mut gap = self.cfg.pair_gap.is_some();
-                ui.horizontal(|ui| {
-                    if ui.checkbox(&mut gap, "Gap between the two traces").on_hover_text("Edge-to-edge distance between the two traces of a pair (not centre-to-centre).").changed() {
-                        self.cfg.pair_gap = if gap { Some(0.6) } else { None };
-                    }
-                    if let Some(g) = &mut self.cfg.pair_gap {
-                        dv(ui, g, k, 0.01, 20.0, 0.01, ul);
-                    } else {
-                        ui.label("(the nets' clearance)");
-                    }
-                });
                 ui.small("Pairs are routed side by side; if that does not fit, the second trace hugs the first.");
 
                 ui.add_space(6.0);
@@ -1660,7 +1675,7 @@ impl App {
         }
         // existing copper (kept on the board and always shown; ghosted when the saved EasyEDA file
         // will not contain it)
-        let ghost = self.easyeda.is_some() && !self.cfg.include_existing;
+        let ghost = false;
         if let Some(pv) = &self.preview {
             for (net, w) in &pv.pre_wires {
                 if !shown(w.layer) {
@@ -2008,28 +2023,31 @@ impl eframe::App for App {
                         }
                     }
                 }
-                if ui
-                    .add_enabled(can_save, egui::Button::new("💾 Save SES…"))
-                    .clicked()
-                {
-                    let stem = std::path::Path::new(&self.path)
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or("out".into());
-                    if let (Some(p), Some(r)) = (
-                        rfd::FileDialog::new()
-                            .set_file_name(format!("{}.ses", stem))
-                            .add_filter("Specctra SES", &["ses"])
-                            .save_file(),
-                        &self.result,
-                    ) {
-                        let _ = std::fs::write(p.with_extension("options.json"), &r.options);
-                        self.msg = match std::fs::write(&p, &r.ses) {
-                            Ok(_) => {
-                                format!("saved {} (settings: {})", p.display(), p.with_extension("options.json").display())
-                            }
-                            Err(e) => e.to_string(),
-                        };
+                // an EasyEDA file is saved as an EasyEDA file; the SES is for Specctra DSN input
+                if self.easyeda.is_none() {
+                    if ui
+                        .add_enabled(can_save, egui::Button::new("💾 Save SES…"))
+                        .clicked()
+                    {
+                        let stem = std::path::Path::new(&self.path)
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or("out".into());
+                        if let (Some(p), Some(r)) = (
+                            rfd::FileDialog::new()
+                                .set_file_name(format!("{}.ses", stem))
+                                .add_filter("Specctra SES", &["ses"])
+                                .save_file(),
+                            &self.result,
+                        ) {
+                            let _ = std::fs::write(p.with_extension("options.json"), &r.options);
+                            self.msg = match std::fs::write(&p, &r.ses) {
+                                Ok(_) => {
+                                    format!("saved {} (settings: {})", p.display(), p.with_extension("options.json").display())
+                                }
+                                Err(e) => e.to_string(),
+                            };
+                        }
                     }
                 }
                 ui.separator();

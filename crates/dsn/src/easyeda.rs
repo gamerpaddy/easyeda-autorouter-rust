@@ -17,6 +17,9 @@ pub const PX_MM: f64 = 0.254;
 pub(crate) const CLEARANCE_MARGIN: f64 = 0.01;
 
 pub struct EasyedaDoc {
+    /// The design rule of the file in millimetres: track width, clearance, via diameter, via
+    /// hole (`DRCRULE` of a Standard file, the default rules of a Pro PCB). None: the file has none.
+    pub rules_mm: Option<[f64; 4]>,
     pub root: Value,
     /// every footprint of the document, in file order
     pub parts: Vec<PartInfo>,
@@ -777,6 +780,10 @@ pub fn load(text: &str) -> Result<EasyedaDoc, String> {
     let drc = root.get("DRCRULE").and_then(|d| d.get("Default"));
     let getf = |k: &str, d: f64| drc.and_then(|r| r.get(k)).and_then(|v| v.as_f64()).unwrap_or(d);
     let (track_w, clear, via_d) = (getf("trackWidth", 1.0), getf("clearance", 0.6) + CLEARANCE_MARGIN, getf("viaHoleDiameter", 2.4));
+    let rules_mm = drc.map(|_| {
+        let via = getf("viaHoleDiameter", 2.4);
+        [track_w * PX_MM, getf("clearance", 0.6) * PX_MM, via * PX_MM, getf("viaHoleD", via / 2.0) * PX_MM]
+    });
     let mut special: Vec<(String, f64, f64)> = vec![];
     if let Some(sn) = root.get("routerRule").and_then(|r| r.get("specialNets")).and_then(|s| s.as_array()) {
         for e in sn {
@@ -789,7 +796,7 @@ pub fn load(text: &str) -> Result<EasyedaDoc, String> {
     finish(
         Collected {
             notes, pads, holes, outline, tracks, vias, strokes, regions, counts, copper, areas, ids, other_outline,
-            track_w, clear, via_d, special, existing,
+            track_w, clear, via_d, special, existing, rules_mm,
         },
         root,
         parts_info,
@@ -820,6 +827,7 @@ pub(crate) struct Collected {
     pub areas: HashSet<(String, String)>,
     pub ids: HashSet<String>,
     pub other_outline: usize,
+    pub rules_mm: Option<[f64; 4]>,
     pub track_w: f64,
     /// clearance including the safety margin
     pub clear: f64,
@@ -838,7 +846,7 @@ pub(crate) fn finish(
 ) -> Result<EasyedaDoc, String> {
     let Collected {
         mut notes, pads, holes, outline, tracks, vias, strokes, regions, counts, copper, areas, ids, other_outline,
-        track_w, clear, via_d, special, existing,
+        track_w, clear, via_d, special, existing, rules_mm,
     } = c;
 
     if other_outline > 0 {
@@ -1108,7 +1116,7 @@ pub(crate) fn finish(
     if !areas.is_empty() {
         notes.push(format!("{} existing copper area(s) are kept; nets and layers that already have one get no new fill", areas.len()));
     }
-    Ok(EasyedaDoc { root, parts: parts_info, dsn: o, ox, oy, notes, areas, ids, pro, existing })
+    Ok(EasyedaDoc { rules_mm, root, parts: parts_info, dsn: o, ox, oy, notes, areas, ids, pro, existing })
 }
 
 #[cfg(test)]

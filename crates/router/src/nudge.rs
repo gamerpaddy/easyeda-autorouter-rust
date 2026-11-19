@@ -129,9 +129,45 @@ fn run_once(board: &Board, parts: &[PartSpec], cfg: &Config, skip: &[(String, St
 /// again, keeping every move that helps.
 pub fn solve(board: &Board, cfg: Config, parts: &[PartSpec], pour_skip: &[(String, String)]) -> Solved {
     let started = std::time::Instant::now();
-    let mut best = run_once(board, parts, &cfg, pour_skip, &[], None);
+    // Retries when connections stay open, each only when the one before left some open: the
+    // coarse grid (0.2 mm) is replaced by the fine one, then traces are searched narrow first
+    // (full-width traces take room that later connections may need). Every run but the last is
+    // a quick one (less rescue effort), the last gets everything.
+    let mut tries: Vec<(bool, bool)> = vec![]; // (fine grid, narrow first)
+    if cfg.grid.is_none() && !cfg.fine_grid {
+        tries.push((true, cfg.narrow_first));
+        if cfg.allow_neckdown && !cfg.narrow_first {
+            tries.push((true, true));
+        }
+    } else if cfg.allow_neckdown && !cfg.narrow_first {
+        tries.push((cfg.fine_grid, true));
+    }
+    let mut first_cfg = cfg.clone();
+    first_cfg.quick = !tries.is_empty();
+    let mut best = run_once(board, parts, &first_cfg, pour_skip, &[], None);
     let mut moves: Vec<(usize, f64, f64)> = vec![];
     let mut log: Vec<String> = vec![];
+    let n_tries = tries.len();
+    for (k, (fine, narrow)) in tries.into_iter().enumerate() {
+        if best.fail == 0 || best.router.cancelled() {
+            break;
+        }
+        let mut c2 = cfg.clone();
+        c2.quick = k + 1 < n_tries;
+        c2.fine_grid = fine;
+        c2.narrow_first = narrow;
+        let alt = run_once(board, parts, &c2, pour_skip, &[], None);
+        if alt.fail < best.fail {
+            log.push(format!(
+                "{} connection(s) stayed open; {}{}routing completes {} more",
+                best.fail,
+                if fine && !cfg.fine_grid { "fine grid " } else { "" },
+                if narrow && !cfg.narrow_first { "narrow-first " } else { "" },
+                best.fail - alt.fail
+            ));
+            best = alt;
+        }
+    }
     if !cfg.nudge_parts || parts.is_empty() || board.components.len() != 1 {
         return Solved { router: best.router, moves, log };
     }

@@ -48,6 +48,10 @@ pub struct DrcRules {
     pub min_via_drill_mm: f64,
     /// copper to board edge
     pub min_edge_clearance_mm: f64,
+    /// Vias are made exactly `min_via_diameter_mm` wide (a net that is given a via of its own
+    /// by its class or an override keeps that one). Off: the via of the project is used and the
+    /// minimum only raises it.
+    pub use_min_via: bool,
 }
 
 impl Default for DrcRules {
@@ -59,7 +63,38 @@ impl Default for DrcRules {
             min_via_diameter_mm: 0.45,
             min_via_drill_mm: 0.20,
             min_edge_clearance_mm: 0.30,
+            use_min_via: true,
         }
+    }
+}
+
+impl DrcRules {
+    /// (key, description) of the built-in presets, see `preset`.
+    pub const PRESETS: [(&'static str, &'static str); 4] = [
+        ("cheapest", "JLCPCB cheapest: 0.127 trace/space, via 0.45 / hole 0.30, no extra charge on any layer count"),
+        ("economic", "JLCPCB 4-layer economic: 0.09 trace/space, via 0.45 / hole 0.20 (hole < 0.3 is free on multilayer only)"),
+        ("minimum", "JLCPCB absolute minimum: 0.09 trace/space, via 0.30 / hole 0.20, copper to edge 0.2 (extra charges)"),
+        ("relaxed", "Relaxed: 0.2 trace/space, via 0.60 / hole 0.30, copper to edge 0.5"),
+    ];
+
+    /// A named set of rules (millimetres): cheapest, economic, minimum, relaxed.
+    pub fn preset(name: &str) -> Option<DrcRules> {
+        let (t, c, vd, vh, e) = match name.trim().to_lowercase().as_str() {
+            "cheapest" | "jlc-cheapest" => (0.127, 0.127, 0.45, 0.30, 0.30),
+            "economic" | "jlc-economic" | "default" => (0.09, 0.09, 0.45, 0.20, 0.30),
+            "minimum" | "jlc-minimum" | "absolute" => (0.09, 0.09, 0.30, 0.20, 0.20),
+            "relaxed" => (0.20, 0.20, 0.60, 0.30, 0.50),
+            _ => return None,
+        };
+        Some(DrcRules {
+            enabled: true,
+            min_trace_mm: t,
+            min_clearance_mm: c,
+            min_via_diameter_mm: vd,
+            min_via_drill_mm: vh,
+            min_edge_clearance_mm: e,
+            use_min_via: true,
+        })
     }
 }
 
@@ -169,10 +204,39 @@ pub struct Config {
     pub nudge_attempts: usize,
     /// Distance (mm) between the stitching vias of overlapping fill areas (0 = no vias).
     pub stitch_pitch_mm: f64,
+    /// Stitching vias only where there is something: within this distance (mm) of a pad, trace
+    /// or via (0 = anywhere on the grid, also in empty areas).
+    pub stitch_near_mm: f64,
     /// The CAD keeps the width of imported tracks. EasyEDA does not (every track gets its rule
     /// width), so by default traces are written as plain centre lines with as few segments as
     /// possible and power traces are not widened.
     pub keep_track_widths: bool,
+    /// Single sided board: every trace on one copper layer, no vias at all (no jumps, no
+    /// via-in-pad, no bridging, no stitching), copper areas on that layer only. Pads that exist
+    /// only on another layer cannot be reached and stay open.
+    pub single_sided: bool,
+    /// Layer used by `single_sided` (None = the layer with the most SMD pads, bottom on a tie).
+    pub single_layer: Option<String>,
+    /// A trace keeps its full width and goes around obstacles as long as the path is at most
+    /// this many times the straight distance (plus 10 mm) long; only then it is narrowed
+    /// (75 %, 50 %, minimum width). 0 = any detour is accepted before narrowing.
+    pub max_detour: f64,
+    /// Less rescue effort (3 rounds, no regional rescue): for a run that is repeated with other
+    /// settings when it leaves connections open. Set by the router itself.
+    pub quick: bool,
+    /// Use the fine grid (a quarter of the track pitch) instead of 0.2 mm. Set by the router
+    /// itself for a second run when the coarse grid leaves connections open.
+    pub fine_grid: bool,
+    /// Search every trace at the minimum width first and widen it afterwards (the old way).
+    /// Set by the router itself for a second run when full-width routing leaves connections open.
+    pub narrow_first: bool,
+    /// Single sided boards, last resort for a connection with no path: hop over other traces
+    /// with a 0 ohm resistor (a part, placed in the CAD from the list the router writes).
+    pub jumpers: bool,
+    /// Resistor sizes the router may use, smallest first (0402, 0603, 0805, 1206).
+    pub jumper_sizes: Vec<String>,
+    /// Search cost of one jumper, in grid cells of trace.
+    pub jumper_cost: f32,
     #[serde(skip)]
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     #[serde(skip)]
@@ -228,7 +292,17 @@ impl Default for Config {
             nudge_max_widths: 3.0,
             nudge_attempts: 6,
             stitch_pitch_mm: 4.0,
+            stitch_near_mm: 3.0,
             keep_track_widths: false,
+            single_sided: false,
+            single_layer: None,
+            max_detour: 3.0,
+            narrow_first: false,
+            fine_grid: false,
+            quick: false,
+            jumpers: true,
+            jumper_sizes: vec!["0402".into(), "0603".into(), "0805".into(), "1206".into()],
+            jumper_cost: 400.0,
             cancel: None,
             on_snapshot: None,
         }
@@ -248,6 +322,79 @@ impl Config {
         }
     }
 
+    /// Single sided board: pick the copper layer (the one named in `single_layer`, else the layer
+    /// holding the most SMD pads, the later one on a tie) and switch off everything that could
+    /// put copper on another layer or drill a hole: other layers become no-routing layers, no
+    /// planes, no jumps, no pad vias, no bridging vias, no stitching vias, no multi-via changes.
+    pub fn apply_single_sided(&mut self, board: &Board) {
+        let mut count = vec![0usize; board.layers.len()];
+        for ap in board.abs_pins().values() {
+            let mut ls: Vec<usize> = ap.shapes.iter().map(|s| s.0).collect();
+            ls.sort_unstable();
+            ls.dedup();
+            if ls.len() == 1 && ls[0] < count.len() {
+                count[ls[0]] += 1;
+            }
+        }
+        let named = self
+            .single_layer
+            .as_ref()
+            .filter(|n| board.layers.iter().any(|l| &l.name == *n))
+            .cloned();
+        let keep = named.unwrap_or_else(|| {
+            let mut best: Option<usize> = None;
+            for (i, l) in board.layers.iter().enumerate() {
+                if l.power {
+                    continue;
+                }
+                if best.is_none_or(|b| count[i] >= count[b]) {
+                    best = Some(i);
+                }
+            }
+            board.layers[best.unwrap_or(board.layers.len().saturating_sub(1))].name.clone()
+        });
+        let keep_idx = board.layers.iter().position(|l| l.name == keep).unwrap_or(0);
+        let stranded: usize = count.iter().enumerate().filter(|(i, _)| *i != keep_idx).map(|(_, c)| *c).sum();
+        if self.verbose {
+            eprintln!("single sided: routing on layer {keep}, no vias");
+            if stranded > 0 {
+                eprintln!("single sided: {stranded} SMD pad(s) are on other layers and cannot be reached");
+            }
+        }
+        self.single_layer = Some(keep.clone());
+        self.exclusive = board.layers.iter().filter(|l| l.name != keep).map(|l| l.name.clone()).collect();
+        self.exclusive_planes.clear();
+        self.layers.retain(|name, _| *name == keep);
+        for plan in self.layers.values_mut() {
+            plan.role = LayerRole::Signal;
+        }
+        self.bridge_vias = 0;
+        // coupled pair routing has its own layer changes: route pair nets as plain nets
+        self.pairs = false;
+        self.allow_plane_jumps = false;
+        self.last_resort_pad_vias = false;
+        self.allow_vias_in_pads = false;
+        self.stitch_pitch_mm = 0.0;
+        for ov in self.net_overrides.values_mut() {
+            ov.via_count = None;
+        }
+    }
+
+    /// The design rule of the imported file (track width, clearance, via diameter, via hole, in
+    /// mm): clearance, via diameter and via hole become the global values, so what the file says
+    /// is used, not defaults or earlier choices. The track width of a file is the width traces
+    /// get by default, not a minimum: it already is each net's width, and the minimum trace width
+    /// (how far a trace may be narrowed as a last option) is left as it is, but never above the
+    /// file's width. The copper-to-edge distance is not part of a file's rule either.
+    pub fn apply_file_rules(&mut self, r: [f64; 4]) {
+        self.rules.enabled = true;
+        self.rules.min_trace_mm = self.rules.min_trace_mm.min(r[0]);
+        self.rules.min_clearance_mm = r[1];
+        self.rules.min_via_diameter_mm = r[2];
+        self.rules.min_via_drill_mm = r[3];
+        self.rules.use_min_via = true;
+    }
+
     pub fn tolerance_for(&self, name: &str) -> f64 {
         self.net_overrides
             .get(name)
@@ -255,8 +402,13 @@ impl Config {
             .copied()
             .unwrap_or(self.pair_tolerance)
     }
-    /// Routing grid: the user's value, else a quarter of the track pitch (width + clearance) so
-    /// neighbouring tracks pack exactly, coarsened until the board fits a sane number of cells.
+    /// Routing grid. Adaptive, not a user option: 0.2 mm, but never coarser than half the track
+    /// pitch (width + clearance) of the rules, so tracks still pass between each other; coarsened
+    /// further only when the board would need an unreasonable number of cells. Tight spots are
+    /// searched again on finer local grids (`adaptive_repair`), and when connections still stay
+    /// open the whole board is routed again on the fine grid (`fine_grid`, a quarter of the
+    /// pitch; see `nudge::solve`). `grid` (an explicit value, used by tests and old settings
+    /// files) overrides all of it.
     pub fn grid_for(&self, board: &Board) -> f64 {
         if let Some(g) = self.grid {
             return g;
@@ -275,22 +427,22 @@ impl Config {
         if w <= 0.0 || c <= 0.0 {
             return dsn;
         }
-        // The obstacle test keeps MARGIN on top of the clearance. Without it in the pitch,
-        // tracks four cells apart miss by a hair and every lane costs five cells.
+        // The obstacle test keeps MARGIN on top of the clearance (see the pitch below).
         let pitch = w + c + MARGIN + 1e-4;
+        let mut g = if self.fine_grid { pitch / 4.0 } else { pitch / 2.0 };
+        if unit_mm > 0.0 && !self.fine_grid {
+            g = g.min(0.2 / unit_mm);
+        }
         let (mut lo, mut hi) = ((f64::MAX, f64::MAX), (f64::MIN, f64::MIN));
         for &(x, y) in &board.boundary {
             lo = (lo.0.min(x), lo.1.min(y));
             hi = (hi.0.max(x), hi.1.max(y));
         }
         let area = ((hi.0 - lo.0) * (hi.1 - lo.1)).max(0.0) * board.layers.len().max(1) as f64;
-        for k in [4.0, 3.0, 2.0] {
-            let g = pitch / k;
-            if area / (g * g) <= 4_000_000.0 || k == 2.0 {
-                return g.max(dsn.min(g));
-            }
+        while area / (g * g) > 4_000_000.0 && g < pitch * 2.0 {
+            g *= 1.25;
         }
-        dsn
+        g
     }
 
     pub fn validate(&self, board: &Board) -> Result<(), String> {
@@ -523,6 +675,74 @@ pub struct Routed {
     pub vias: Vec<P>,
     pub tree: Vec<Cell>,
     pub dynp: Vec<Prim>,
+    /// 0 ohm resistors that carry the net over other traces (single sided boards)
+    pub jumpers: Vec<Jumper>,
+}
+
+/// Land pattern of a jumper resistor, in millimetres: centre distance of the pads, pad length
+/// (along the part) and pad width (across it). Taken from the EasyEDA / LCSC footprints R0402,
+/// R0603, R0805 and R1206; the gap between the pads (pitch - length) is the room for the traces
+/// that pass under the body.
+pub fn jumper_land(name: &str) -> Option<(f64, f64, f64)> {
+    match name {
+        "0402" => Some((0.8656, 0.5656, 0.5400)),
+        "0603" => Some((1.5067, 0.8065, 0.8640)),
+        "0805" => Some((2.0000, 1.1325, 1.3770)),
+        "1206" => Some((2.9576, 1.2075, 1.7010)),
+        _ => None,
+    }
+}
+
+/// The 0 ohm resistor of that size as JLCPCB Basic part: (LCSC number, manufacturer part).
+pub fn jumper_part(name: &str) -> Option<(&'static str, &'static str)> {
+    match name {
+        "0402" => Some(("C17168", "0402WGF0000TCE")),
+        "0603" => Some(("C21189", "0603WAF0000T5E")),
+        "0805" => Some(("C17477", "0805W8F0000T5E")),
+        "1206" => Some(("C17888", "1206W4F0000T5E")),
+        _ => None,
+    }
+}
+
+/// A jumper size in router units, for the current grid.
+#[derive(Clone, Debug)]
+pub struct JSize {
+    pub name: String,
+    pub pitch: f64,
+    pub along: f64,
+    pub across: f64,
+    /// centre distance in grid cells (the search hops this far)
+    pub cells: i32,
+}
+
+/// One 0 ohm resistor on the copper layer, its two pads on the net it carries.
+#[derive(Clone, Debug)]
+pub struct Jumper {
+    pub layer: usize,
+    pub size: String,
+    /// pad centres
+    pub p: [P; 2],
+    /// pad length along the part / width across it
+    pub along: f64,
+    pub across: f64,
+}
+
+impl Jumper {
+    /// The two pads as copper of net `net`.
+    pub fn pads(&self, net: i32, clr: f64) -> [Prim; 2] {
+        let d = dist(self.p[0], self.p[1]).max(1e-9);
+        let u = ((self.p[1].0 - self.p[0].0) / d, (self.p[1].1 - self.p[0].1) / d);
+        let v = (-u.1, u.0);
+        let rect = |c: P| {
+            let (hl, hw) = (self.along / 2.0, self.across / 2.0);
+            let pt = |a: f64, b: f64| (c.0 + u.0 * a + v.0 * b, c.1 + u.1 * a + v.1 * b);
+            Prim::new(self.layer, Geo::Poly(vec![pt(-hl, -hw), pt(hl, -hw), pt(hl, hw), pt(-hl, hw)]), net, clr)
+        };
+        [rect(self.p[0]), rect(self.p[1])]
+    }
+    pub fn centre(&self) -> P {
+        ((self.p[0].0 + self.p[1].0) / 2.0, (self.p[0].1 + self.p[1].1) / 2.0)
+    }
 }
 
 #[derive(Clone)]
@@ -535,6 +755,11 @@ pub struct NetState {
     pub via_r: f64,
     pub tf: usize,
     pub narrow_tf: usize,
+    /// trace fields from the full width down to the minimum width (widest first)
+    pub ladder: Vec<usize>,
+    /// fields for the pads of each jumper size (parallel to `Router::jsizes`): a circle inside
+    /// the pad (optimistic) and a circle round it (safe)
+    pub jfields: Vec<(usize, usize)>,
     pub vf: usize,
     pub r: Routed,
     pub unconnected: Vec<usize>,
@@ -585,6 +810,8 @@ pub struct SearchBuf {
     heap: BinaryHeap<Reverse<u64>>,
 }
 
+pub static PROF_ADAPTIVE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub struct Router {
     pub ground_fill_length: f64,
     pub cfg: Config,
@@ -618,6 +845,12 @@ pub struct Router {
     pub pop_budget: usize,
     /// last-resort mode: traces may use plane / no-routing layers at a high cost
     pub jump_mode: bool,
+    /// last-resort mode (single sided): paths may hop over other traces with a jumper resistor
+    pub jumper_mode: bool,
+    /// jumper pad places are checked with the circle round the pad instead of the one inside it
+    pub jcons: bool,
+    /// jumper sizes in use (empty = no jumpers)
+    pub jsizes: Vec<JSize>,
     /// last-resort mode: the failing net may put vias inside its own pads
     pub pad_via_mode: bool,
     /// A* heuristic weight (1 = exact shortest path; larger = faster, a little longer)
@@ -706,7 +939,10 @@ impl Router {
 
     /// `light`: analyse only (pins, existing copper, planes, connectivity) without allocating
     /// the routing grid fields; used for the GUI preview.
-    pub fn new_with(board: &Board, cfg: Config, light: bool) -> Router {
+    pub fn new_with(board: &Board, mut cfg: Config, light: bool) -> Router {
+        if cfg.single_sided {
+            cfg.apply_single_sided(board);
+        }
         let nl = board.layers.len();
         let g = cfg.grid_for(board);
         let (mut bx0, mut by0, mut bx1, mut by1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
@@ -782,13 +1018,22 @@ impl Router {
                 .or(cl.and_then(|c| c.clearance))
                 .unwrap_or(default_c)
                 .max(min_c);
-            let via = ov
+            // a via chosen for this net by the user (net override); the via of the net class or of
+            // the project is what `use_min_via` replaces
+            let own_via = ov
                 .and_then(|o| o.via.clone())
-                .filter(|v| board.via_names.contains(v) || board.padstacks.contains_key(v))
+                .filter(|v| board.via_names.contains(v) || board.padstacks.contains_key(v));
+            let via = own_via
+                .clone()
                 .or_else(|| cl.and_then(|c| c.vias.first().cloned()))
                 .or_else(|| board.via_names.first().cloned())
                 .unwrap_or_default();
-            let via_r = via_radius(board, &via).max(min_via_r);
+            // the configured via size, unless the net is given a via of its own
+            let via_r = if cfg.rules.enabled && cfg.rules.use_min_via && own_via.is_none() && min_via_r > 0.0 {
+                min_via_r
+            } else {
+                via_radius(board, &via).max(min_via_r)
+            };
             for p in &n.pins {
                 pin_net.insert(format!("{}-{}", p.comp, p.pin), i as i32);
             }
@@ -801,6 +1046,8 @@ impl Router {
                 via_r,
                 tf: 0,
                 narrow_tf: 0,
+                ladder: vec![],
+                jfields: vec![],
                 vf: 0,
                 r: Routed::default(),
                 unconnected: vec![],
@@ -965,9 +1212,43 @@ impl Router {
                 fields.len() - 1
             })
         };
+        // jumper sizes for this grid (distinct hop lengths of at least two cells)
+        let mut jsizes: Vec<JSize> = vec![];
+        if cfg.single_sided && cfg.jumpers && !light && unit_mm > 0.0 {
+            for name in &cfg.jumper_sizes {
+                let Some((pitch, along, across)) = jumper_land(name.trim()) else { continue };
+                let cells = (pitch / unit_mm / grid.g).round() as i32;
+                if cells >= 2 && jsizes.iter().all(|s| s.cells != cells) && !jsizes.iter().any(|s| s.name == *name) {
+                    jsizes.push(JSize { name: name.trim().to_string(), pitch: pitch / unit_mm, along: along / unit_mm, across: across / unit_mm, cells });
+                }
+            }
+            jsizes.sort_by_key(|s| s.cells);
+        }
         for n in nets.iter_mut() {
+            for s in &jsizes {
+                // circles for the pad places: one inside the pad, one round it. The exact pads
+                // are checked afterwards (see `jumper_pass`).
+                let r_safe = 0.5 * (s.along * s.along + s.across * s.across).sqrt();
+                let a = get_field(n.clr, s.along / 2.0, false, &mut fields);
+                let b = get_field(n.clr, r_safe, false, &mut fields);
+                n.jfields.push((a, b));
+            }
             n.tf = get_field(n.clr, n.width / 2.0, false, &mut fields);
             n.narrow_tf = get_field(n.clr, n.width.min(min_w.max(grid.g * 0.05)) / 2.0, false, &mut fields);
+            // widest first: full width, 75 %, 50 %, minimum width (only widths that differ)
+            let floor_w = min_w.max(grid.g * 0.05);
+            let mut ladder = vec![n.tf];
+            if cfg.allow_neckdown {
+                for f in [0.75, 0.5] {
+                    let w = n.width * f;
+                    if w > floor_w * 1.1 {
+                        let t = get_field(n.clr, w / 2.0, false, &mut fields);
+                        if !ladder.contains(&t) { ladder.push(t); }
+                    }
+                }
+                if !ladder.contains(&n.narrow_tf) { ladder.push(n.narrow_tf); }
+            }
+            n.ladder = ladder;
             n.vf = get_field(n.clr, n.via_r, true, &mut fields);
         }
         let mut pair_list = dsn::find_diff_pairs(&board.nets);
@@ -1044,6 +1325,9 @@ impl Router {
             t_cat: [0.0; 4],
             pop_budget: 0,
             jump_mode: false,
+            jumper_mode: false,
+            jcons: false,
+            jsizes,
             pad_via_mode: false,
             h_weight: h_weight(),
             via_shortfall: 0,
@@ -1343,6 +1627,18 @@ impl Router {
             self.buf.tmark = vec![0; total];
         }
         let layer_cost = self.routing_layer_costs(self.cur_net);
+        // jumper hops (single sided last resort): (hop length in cells, field of the pad circle)
+        let hops: Vec<(i32, &Field)> = if self.jumper_mode && self.cur_net < self.nets.len() {
+            self.jsizes
+                .iter()
+                .zip(&self.nets[self.cur_net].jfields)
+                .map(|(s, &(a, b))| (s.cells, &self.fields[if self.jcons { b } else { a }]))
+                .collect()
+        } else {
+            vec![]
+        };
+        let hop_mid: Option<&Field> = if hops.is_empty() { None } else { Some(&self.fields[self.nets[self.cur_net].narrow_tf]) };
+        let jcost = self.cfg.jumper_cost;
         let buf = &mut self.buf;
         for &t in &buf.touched {
             buf.g[t as usize] = f32::INFINITY;
@@ -1521,6 +1817,39 @@ impl Router {
                     heap.push(key(ng + h(xx, yy), i2));
                 }
             }
+            // jumper resistor: hop straight over whatever lies between two free pad places
+            for &(cells, jf) in hops.iter() {
+                for (dx, dy) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
+                    let (xx, yy) = (x + dx * cells, y + dy * cells);
+                    if xx < wx0 || xx > wx1 || yy < wy0 || yy > wy1 {
+                        continue;
+                    }
+                    let i2 = base + (yy * nx + xx) as usize;
+                    let ng = gs + jcost + cells as f32 * 3.0;
+                    if ng >= buf.g[i2] {
+                        continue;
+                    }
+                    let (b1, b2) = (Self::blk_trace(jf, excl, &grid, l, s), Self::blk_trace(jf, excl, &grid, l, i2));
+                    if b1 == Blk::Hard || b2 == Blk::Hard || (!soft && (b1 == Blk::Soft || b2 == Blk::Soft)) {
+                        continue;
+                    }
+                    // nothing fixed (pads, holes, board edge) under the body; routed traces may pass
+                    let mid = hop_mid.unwrap();
+                    if (1..cells).any(|t| mid.fx(base + ((y + dy * t) * nx + (x + dx * t)) as usize)) {
+                        continue;
+                    }
+                    if buf.g[i2].is_infinite() {
+                        buf.touched.push(i2 as u32);
+                    }
+                    buf.g[i2] = ng;
+                    buf.par[i2] = s as u32;
+                    heap.push(key(ng + h(xx, yy), i2));
+                }
+            }
+            // single sided board: no layer changes at all
+            if self.cfg.single_sided {
+                continue;
+            }
             // vias: through via to every other (non exclusive) layer
             let ci = rem;
             let vblk = match vf.via_col(ci) {
@@ -1592,7 +1921,7 @@ impl Router {
         seeds: &[Cell],
         targets: &[Cell],
     ) -> bool {
-        if self.cur_land || self.jump_mode {
+        if self.cur_land || self.jump_mode || self.jumper_mode {
             return true;
         }
         let t = Instant::now();
@@ -1692,7 +2021,7 @@ impl Router {
                     q.push_back(i2 as u32);
                 }
             }
-            if vf.via_col(rem) != (false, false) {
+            if self.cfg.single_sided || vf.via_col(rem) != (false, false) {
                 continue;
             }
             for ll in 0..grid.nl {
@@ -1864,8 +2193,42 @@ impl Router {
     }
 
     pub(crate) fn commit_path(&mut self, n: usize, path: &[Cell], requested_width: f64) {
-        let (mut wires, vias) = self.path_geometry(n, path);
+        // a jumper hop is a step of more than one cell on the same layer
+        let hops: Vec<usize> = (0..path.len().saturating_sub(1))
+            .filter(|&i| path[i].0 == path[i + 1].0 && ((path[i].1 - path[i + 1].1).abs() > 1 || (path[i].2 - path[i + 1].2).abs() > 1))
+            .collect();
+        let (mut wires, vias) = if hops.is_empty() {
+            self.path_geometry(n, path)
+        } else {
+            let (mut w, mut v) = (vec![], vec![]);
+            let mut start = 0;
+            for &i in &hops {
+                let (a, b) = self.path_geometry(n, &path[start..=i]);
+                w.extend(a);
+                v.extend(b);
+                start = i + 1;
+            }
+            let (a, b) = self.path_geometry(n, &path[start..]);
+            w.extend(a);
+            v.extend(b);
+            (w, v)
+        };
         let (clr, via_r) = (self.nets[n].clr, self.nets[n].via_r);
+        let mut new_jumpers: Vec<Jumper> = vec![];
+        for &i in &hops {
+            let (a, b) = (self.grid.center(path[i].1, path[i].2), self.grid.center(path[i + 1].1, path[i + 1].2));
+            let cells = (path[i].1 - path[i + 1].1).abs().max((path[i].2 - path[i + 1].2).abs());
+            let Some(js) = self.jsizes.iter().find(|s| s.cells == cells) else { continue };
+            let d = dist(a, b).max(1e-9);
+            let (m, u) = (((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0), ((b.0 - a.0) / d, (b.1 - a.1) / d));
+            new_jumpers.push(Jumper {
+                layer: path[i].0,
+                size: js.name.clone(),
+                p: [(m.0 - u.0 * js.pitch / 2.0, m.1 - u.1 * js.pitch / 2.0), (m.0 + u.0 * js.pitch / 2.0, m.1 + u.1 * js.pitch / 2.0)],
+                along: js.along,
+                across: js.across,
+            });
+        }
         if self.nets[n].width < requested_width && !self.cfg.trace_routing {
             wires = self.widened_wires(n, &wires, requested_width);
         }
@@ -1895,6 +2258,10 @@ impl Router {
                 ns.r.tree.push((l, x, y));
             }
         }
+        for j in &new_jumpers {
+            ns.r.dynp.extend(j.pads(n as i32, clr));
+        }
+        ns.r.jumpers.extend(new_jumpers);
         ns.r.tree.extend_from_slice(path);
         ns.r.wires.extend(wires);
         if self.pad_via_mode {
@@ -2008,10 +2375,26 @@ impl Router {
         let ny = self.grid.ny as i32;
         let full = (0, 0, nx - 1, ny - 1);
         let planned_width = self.nets[n].width;
-        let staged = self.cfg.trace_routing && self.cfg.allow_neckdown;
-        let fi = (if staged { self.nets[n].narrow_tf } else { self.nets[n].tf }, self.nets[n].vf);
+        // Widest first: full width (going around obstacles), then 75 %, 50 %, minimum width.
+        // Narrowing is the last option, tried only when no acceptable path exists at the
+        // wider setting.
+        let ladder: Vec<usize> = if self.cfg.allow_neckdown && self.cfg.narrow_first {
+            vec![self.nets[n].narrow_tf]
+        } else if self.cfg.allow_neckdown && !self.nets[n].ladder.is_empty() {
+            self.nets[n].ladder.clone()
+        } else {
+            vec![self.nets[n].tf]
+        };
+        // hop searches cover the whole board: only the widest and the narrowest setting
+        let ladder: Vec<usize> = if self.jumper_mode && ladder.len() > 2 {
+            vec![ladder[0], *ladder.last().unwrap()]
+        } else {
+            ladder
+        };
+        let vfi = self.nets[n].vf;
+        let narrow_fi = (*ladder.last().unwrap(), vfi);
         while !remaining.is_empty() {
-            self.nets[n].width = if staged { self.fields[fi.0].p * 2.0 } else { planned_width };
+            self.nets[n].width = planned_width;
             // nearest group to the connected set
             let mut best = (f64::MAX, 0usize);
             for (ri, &c) in remaining.iter().enumerate() {
@@ -2036,6 +2419,8 @@ impl Router {
             }
             let margin = (30.0 / self.grid.g) as i32;
             let (seeds, targets, win0): (Vec<Cell>, Vec<Cell>, (i32, i32, i32, i32));
+            // straight-line distance (cells) between the connected tree and the next group
+            let mut detour_lb: Option<i32> = None;
             if let Some((ll, mask)) = &landing {
                 // plane mode: grow from the group towards the tree or any free plane cell
                 let m = margin * 2;
@@ -2057,6 +2442,7 @@ impl Router {
                     let dy = (by0 - y).max(y - by1).max(0);
                     dmin = dmin.min(dx.max(dy));
                 }
+                detour_lb = Some(dmin);
                 let r = dmin.saturating_add(margin).min(nx.max(ny));
                 seeds = tree.clone();
                 targets = comp_cells.clone();
@@ -2067,16 +2453,6 @@ impl Router {
                     (by1 + r).min(ny - 1),
                 );
             }
-            let tc = Instant::now();
-            // a bounded first try: when it runs away, the cheap flood below decides what is next
-            self.pop_budget = 60_000;
-            let mut path = if win0 != full {
-                self.astar(fi, &seeds, &targets, false, win0, 0.0)
-            } else {
-                None
-            };
-            self.pop_budget = 0;
-            self.t_cat[0] += tc.elapsed().as_secs_f32();
             // full-board targets (plane mode needs the whole plane as target set)
             let targets_full: Vec<Cell> = match &landing {
                 Some((ll, mask)) => {
@@ -2086,34 +2462,61 @@ impl Router {
                 }
                 None => targets.clone(),
             };
-            let tc = Instant::now();
-            if path.is_none() && self.reachable(fi, &seeds, &targets_full) {
-                // long detours: the flood proved a path exists, so favour speed over exactness
-                self.h_weight = full_h_weight();
-                path = if landing.is_some() {
-                    self.astar(fi, &seeds, &targets_full, false, full, 0.0)
-                } else {
-                    self.full_search(fi, &seeds, &targets_full, full)
-                };
-                self.h_weight = h_weight();
-            }
-            self.t_cat[1] += tc.elapsed().as_secs_f32();
-            let tc = Instant::now();
             let requested_width = planned_width;
-            let narrow_fi = (self.nets[n].narrow_tf, fi.1);
-            let narrow_width = self.fields[narrow_fi.0].p * 2.0;
-            if path.is_none() && self.cfg.allow_neckdown && narrow_fi.0 != fi.0 && narrow_width < requested_width {
-                if self.reachable(narrow_fi, &seeds, &targets_full) {
-                    path = self.astar(narrow_fi, &seeds, &targets_full, false, full, 0.0);
-                    if path.is_some() { self.nets[n].width = narrow_width; }
+            // longest path (cells) accepted at a width that is not the narrowest one
+            let detour_cap: Option<usize> = match detour_lb {
+                Some(lb) if self.cfg.max_detour > 0.0 => {
+                    let slack = 10.0 / self.unit_mm.max(1e-12) / self.grid.g;
+                    Some((self.cfg.max_detour * lb as f64 + slack).ceil() as usize)
+                }
+                _ => None,
+            };
+            let mut path: Option<Vec<Cell>> = None;
+            for (ri, &tfi) in ladder.iter().enumerate() {
+                let last = ri + 1 == ladder.len();
+                let fir = (tfi, vfi);
+                self.nets[n].width = self.fields[tfi].p * 2.0;
+                let tc = Instant::now();
+                // a bounded first try: when it runs away, the cheap flood below decides what is next
+                self.pop_budget = 60_000;
+                let mut p = if win0 != full {
+                    self.astar(fir, &seeds, &targets, false, win0, 0.0)
+                } else {
+                    None
+                };
+                self.pop_budget = 0;
+                self.t_cat[if ri == 0 { 0 } else { 3 }] += tc.elapsed().as_secs_f32();
+                let tc = Instant::now();
+                if p.is_none() && self.reachable(fir, &seeds, &targets_full) {
+                    // long detours: the flood proved a path exists, so favour speed over exactness
+                    self.h_weight = full_h_weight();
+                    p = if landing.is_some() {
+                        self.astar(fir, &seeds, &targets_full, false, full, 0.0)
+                    } else {
+                        self.full_search(fir, &seeds, &targets_full, full)
+                    };
+                    self.h_weight = h_weight();
+                }
+                self.t_cat[if ri == 0 { 1 } else { 3 }] += tc.elapsed().as_secs_f32();
+                // a silly detour is not worth the width: narrow instead
+                if let (Some(q), Some(cap)) = (&p, detour_cap) {
+                    if !last && q.len() > cap {
+                        p = None;
+                    }
+                }
+                if p.is_some() {
+                    path = p;
+                    break;
                 }
             }
-            self.t_cat[3] += tc.elapsed().as_secs_f32();
+            if path.is_none() {
+                self.nets[n].width = planned_width;
+            }
             let tc = Instant::now();
             if path.is_none() && allow_rip && self.rip_events < self.cfg.max_rip_events {
                 // Escape fine-pitch pads at the legal neckdown width even when
                 // the escape needs to displace routed copper. Fixed pads stay hard.
-                let rip_fi = if self.cfg.allow_neckdown { narrow_fi } else { fi };
+                let rip_fi = narrow_fi;
                 if let Some(p) = self.astar(rip_fi, &seeds, &targets_full, true, full, 25.0) {
                     let mut victims: Vec<usize> = self.path_victims(n, &p, rip_fi.0).into_iter().collect();
                     victims.sort();
@@ -2303,8 +2706,12 @@ impl Router {
     pub fn rescue(&mut self) {
         let mut explored = HashSet::new();
         let mut stale = 0;
+        // rounds in a row that did not bring the number of open connections below its best:
+        // moves between equally bad states are tried, but not for ever
+        let mut best_open = self.unrouted_count();
+        let mut no_gain = 0;
         let threads = self.spec_threads();
-        for round in 0..8 {
+        for round in 0..(if self.cfg.quick { 3 } else { 8 }) {
             let failing: Vec<usize> = (0..self.nets.len())
                 .filter(|&n| !self.nets[n].unconnected.is_empty() && !self.nets[n].skip)
                 .collect();
@@ -2346,7 +2753,7 @@ impl Router {
                         let mut accepted = None;
                         for (n, open, remaining, saved) in results {
                             if self.cfg.verbose {
-                                eprintln!("rescue round {} {}: open {} -> {} {:?} (parallel)", round + 1, self.nets[n].name, before, open,
+                                eprintln!("[{:.1}s] rescue round {} {}: open {} -> {} {:?} (parallel)", self.t0.elapsed().as_secs_f32(), round + 1, self.nets[n].name, before, open,
                                     remaining.iter().map(|&m| self.nets[m].name.clone()).collect::<Vec<_>>());
                             }
                             if open < before || (open == before && explored.insert(remaining)) {
@@ -2377,7 +2784,7 @@ impl Router {
                 // net before it can be solved. Keep novel equal-completion states;
                 // rejecting every plateau makes this repair impossible.
                 if self.cfg.verbose {
-                    eprintln!("rescue round {} {}: open {} -> {} {:?}", round + 1, self.nets[n].name, before, open,
+                    eprintln!("[{:.1}s] rescue round {} {}: open {} -> {} {:?}", self.t0.elapsed().as_secs_f32(), round + 1, self.nets[n].name, before, open,
                         remaining.iter().map(|&m| self.nets[m].name.clone()).collect::<Vec<_>>());
                 }
                 if open < before || (open == before && explored.insert(remaining)) {
@@ -2411,6 +2818,16 @@ impl Router {
             stale = if progress { 0 } else { stale + 1 };
             if stale >= 3 {
                 return;
+            }
+            let open_now = self.unrouted_count();
+            if open_now < best_open {
+                best_open = open_now;
+                no_gain = 0;
+            } else {
+                no_gain += 1;
+                if no_gain >= 2 {
+                    return;
+                }
             }
         }
     }
@@ -2820,6 +3237,72 @@ impl Router {
 
     fn last_resorts(&mut self) {
         self.jump_pass();
+        self.jumper_pass();
+    }
+
+    /// Single sided boards, the very last resort: a connection with no path at all hops over the
+    /// traces in its way with a 0 ohm resistor (0603, 0805 or 1206, smallest that fits). The net
+    /// is routed again with hops allowed; the result is kept only when fewer connections stay
+    /// open and the exact pads and traces keep their clearances.
+    pub fn jumper_pass(&mut self) {
+        if !(self.cfg.single_sided && self.cfg.jumpers) || self.jsizes.is_empty() {
+            return;
+        }
+        let failing: Vec<usize> = (0..self.nets.len())
+            .filter(|&n| !self.nets[n].unconnected.is_empty() && !self.nets[n].skip)
+            .collect();
+        for n in failing {
+            let old = (self.nets[n].r.clone(), self.nets[n].unconnected.clone());
+            let (c, gd) = (self.nets[n].coupled, self.nets[n].guided);
+            // first with pad places checked by a circle inside the pad (finds the smallest part
+            // that fits), then, if the exact pads clash, with a circle round the pad
+            for safe in [false, true] {
+                if self.cancelled() {
+                    return;
+                }
+                self.jcons = safe;
+                self.jumper_mode = true;
+                self.route_missing(n);
+                self.jumper_mode = false;
+                self.jcons = false;
+                let now = self.nets[n].unconnected.len();
+                let mut bad = false;
+                if now < old.1.len() {
+                    let new = self.nets[n].r.dynp.clone();
+                    bad = self.prims_conflict(&new).is_some();
+                }
+                if self.cfg.verbose {
+                    eprintln!(
+                        "jumpers {}: open {} -> {}, {} jumper(s){}",
+                        self.nets[n].name,
+                        old.1.len(),
+                        now,
+                        self.nets[n].r.jumpers.len(),
+                        if bad { " (clearance of the exact pads failed)" } else { "" }
+                    );
+                }
+                let ok = !bad && now < old.1.len();
+                if !ok {
+                    let prims = std::mem::take(&mut self.nets[n].r.dynp);
+                    self.stamp_dyn(&prims, -1);
+                    self.nets[n].r = old.0.clone();
+                    self.nets[n].unconnected = old.1.clone();
+                    let prims = self.nets[n].r.dynp.clone();
+                    self.stamp_dyn(&prims, 1);
+                }
+                self.nets[n].coupled = c;
+                self.nets[n].guided = gd;
+                // a search that found no hop at all will not do better with larger circles
+                if ok || !bad {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Every jumper resistor of the result: (net index, jumper).
+    pub fn jumper_list(&self) -> Vec<(usize, &Jumper)> {
+        self.nets.iter().enumerate().flat_map(|(i, n)| n.r.jumpers.iter().map(move |j| (i, j))).collect()
     }
 
     /// The routing loop: every net in `order`, with rip-up queue, retries and the rescue pass.
@@ -2925,9 +3408,16 @@ impl Router {
             eprintln!("phase retries done {:.1}s, open {}", t.elapsed().as_secs_f32(), self.unrouted_count());
         }
         self.snapshot("Resolving remaining connections (keeping routed progress)");
+        let tr = Instant::now();
         self.rescue();
-        self.regional_rescue();
+        let t_rescue = tr.elapsed().as_secs_f32();
+        let tr = Instant::now();
+        if !self.cfg.quick {
+            self.regional_rescue();
+        }
         if self.cfg.verbose {
+            eprintln!("rescue {:.1}s, regional rescue {:.1}s, adaptive (all, cumulative) {:.1}s", t_rescue, tr.elapsed().as_secs_f32(),
+                PROF_ADAPTIVE_MS.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0);
             eprintln!("phase rescue done {:.1}s, open {}", t.elapsed().as_secs_f32(), self.unrouted_count());
         }
     }
@@ -3109,6 +3599,9 @@ impl Router {
             t_cat: [0.0; 4],
             pop_budget: self.pop_budget,
             jump_mode: self.jump_mode,
+            jumper_mode: self.jumper_mode,
+            jcons: self.jcons,
+            jsizes: self.jsizes.clone(),
             pad_via_mode: self.pad_via_mode,
             h_weight: self.h_weight,
             via_shortfall: 0,
@@ -3199,6 +3692,7 @@ impl Router {
             && !ns.guided
             && ns.r.dynp.is_empty()
             && !self.jump_mode
+            && !self.jumper_mode
             && !self.pad_via_mode
     }
 
@@ -3236,6 +3730,7 @@ impl Router {
         self.cfg.allow_vias_in_pads = m.cfg.allow_vias_in_pads;
         self.h_weight = m.h_weight;
         self.jump_mode = m.jump_mode;
+        self.jumper_mode = m.jumper_mode;
         self.pad_via_mode = m.pad_via_mode;
         self.pop_budget = m.pop_budget;
     }

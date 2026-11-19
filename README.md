@@ -11,11 +11,11 @@ Export the project with **File > Export > EasyEDA source** and open the resultin
 - A DSN has no copper areas, solid regions, rectangles, circles, arcs, drill holes, board cutouts or vias that are part of a footprint. The router would route straight through them and EasyEDA would report DRC errors when you import the result.
 - The routing result of a DSN workflow is an SES file, and an SES file cannot carry track widths or copper areas back into EasyEDA.
 
-The JSON contains all of it, and the result is written back into a copy of the same JSON. Nothing else in the project is changed, new tracks, vias and areas are appended (the only exception are small parts, if you enable nudging). The tracks and vias that were already on the board are always shown and routed around, but they are left out of the saved file unless you enable **Keep the existing tracks and vias in the saved file** (`--include-existing`), like the SES, which holds only the new routes. Left out, the nets that rely on them stay open in that file.
+The JSON contains all of it, and the result is written back into a copy of the same JSON. Nothing else in the project is changed, new tracks, vias and areas are appended (the only exception are small parts, if you enable nudging). The tracks and vias that were already on the board are routed around and stay in the saved file, the result is added to them. (Only the SES of a DSN input holds just the new routes, unless you enable `--include-existing`.) An EasyEDA file is saved as an EasyEDA file, there is no SES for it.
 
 ## EasyEDA Pro projects
 
-EasyEDA Pro projects can be opened directly, no export is needed. Both file formats work: `.epro2` and the older `.epro` (one file per document inside the archive). The result is saved in the format that was opened. The router reads the PCB of the project (its footprints, pads with round and slot holes, tracks, vias, solid fills, copper pours, slot regions, board outline and cut-outs, design rules) and keeps clear of all of it. The result is saved as a new project file: the new tracks, vias and copper pours are appended to the PCB, everything else in the project (schematic, libraries, images, footprints, regions, pours, parts) stays as it was. The existing tracks and vias of the PCB are shown in the preview (ghosted when they will not be saved) and left out of the saved file unless **Keep the existing tracks and vias in the saved file** (`--include-existing`) is on.
+EasyEDA Pro projects can be opened directly, no export is needed. Both file formats work: `.epro2` and the older `.epro` (one file per document inside the archive). The result is saved in the format that was opened. The router reads the PCB of the project (its footprints, pads with round and slot holes, tracks, vias, solid fills, copper pours, slot regions, board outline and cut-outs, design rules) and keeps clear of all of it. The result is saved as a new project file: the new tracks, vias and copper pours are appended to the PCB, everything else in the project (schematic, libraries, images, footprints, regions, pours, parts) stays as it was. The existing tracks and vias of the PCB are routed around and stay in the project.
 
 ```
 autorouter.exe -nogui project.epro2 -o project-routed.epro2
@@ -59,6 +59,14 @@ Measured on an Intel Core i7-13700KF, release build, full run including clean-up
 | ADAU1452 DSP board | 81 x 80 mm | 4 | 85 | 219 | 24.6 s | all routed, 0 clearance errors |
 | ESP32-S3 module board | 31 x 31 mm | 4 | 18 | 86 | 7.9 s | all routed, 0 clearance errors |
 
+With the adaptive routing grid (0.2 mm, see How it works) most boards are routed in a few seconds. Two more boards of the current version, as shown in the program:
+
+![244 connections routed in 3.1 seconds, 0 clearance violations](docs/routed-244-connections-3s.png)
+
+![188 connections routed in 1.8 seconds, 0 clearance violations](docs/routed-188-connections-2s.png)
+
+The timings in the table above are from an earlier version and were not measured again.
+
 Independent nets and repair trials run in parallel on the CPU. The router sizes the worker pool to the available logical cores and the memory needed for the board grid. `AR_THREADS` can lower the worker count.
 
 ## Workflow
@@ -98,28 +106,36 @@ The settings of every run are saved next to the result as `board-routed.options.
 | group | Nets with the same name are routed together and length matched. |
 | route | Untick to leave a net alone. |
 
-**Design rules**: global minimums for trace width, clearance, via size and copper to board edge. Everything smaller is raised to these values. The default is a typical 4 layer economic fabrication process.
+**Design rules**: global minimums for trace width, clearance, via size and copper to board edge. Everything smaller is raised to these values.
+
+- When an EasyEDA file is imported, its own design rule is used (the `DRCRULE` of a Standard file, the default rules of a Pro PCB): clearance, via diameter and via hole become the global values, not the defaults or the choice of the last board. The track width of a file is the default width of the traces, not a minimum, so the minimum trace width (the floor for narrowing a trace as the last option) stays as it was, never above the file's width. Rule switches on the command line (`--rules`, `--min-*`) and `--options` files win over the file.
+- **Make vias exactly the minimum diameter** (default on, `--project-via` turns it off): vias are made as wide as the via diameter of the rules (nets with a via of their own override keep it). With it off the via of the project is used and the minimum only raises it (a project via of 0.61 mm then stays 0.61 mm). The drill is the via hole of the rules, never leaving less than 0.1 mm of ring around it (JLCPCB: diameter >= hole + 0.1).
+- **Presets** (`--rules NAME`, buttons in the GUI): `cheapest` JLCPCB, no extra charge on any layer count (0.127 trace/space, via 0.45 / hole 0.30), `economic` (the default: 0.09, via 0.45 / hole 0.20, a hole under 0.3 is free on multilayer boards only), `minimum` JLCPCB absolute minimum (0.09, via 0.30 / hole 0.20, copper to edge 0.2, extra charges), `relaxed` (0.2, via 0.60 / hole 0.30, edge 0.5). Check the numbers against the current JLCPCB capability page before ordering.
+- **Stitching vias** (`--stitch-pitch-mm`, `--stitch-near-mm`): only placed within 3 mm of a pad, trace or via, so empty areas stay free of vias (`--stitch-near-mm 0` = everywhere on the grid).
 
 **Routing**
 
 | Option | Meaning |
 |---|---|
 | Allow vias inside pads | Off by default. |
-| Narrow a trace where the full width does not fit | Falls back to 75, 50 and 35 percent of the width and restores it wherever there is room. |
+| Narrow a trace where the full width does not fit | Last option. A trace first keeps its full width and goes around obstacles (as long as the path is at most "Longest detour at full width" times the straight distance, plus 10 mm). Only when that fails it is tried at 75 %, then 50 %, then the minimum trace width, and the full width is restored wherever there is room. |
+| Longest detour at full width | `--max-detour`, default 3. 0 = any detour is accepted before narrowing. |
+| Single sided board | `--single-sided` (`--single-layer NAME`). One copper layer, no vias at all: no layer changes, no via-in-pad, no jumps, no bridging or stitching vias, no multi-via changes, no differential-pair coupling, copper areas on that layer only. The layer is the one with the most SMD pads (bottom on a tie). Pads that exist only on the other layer cannot be reached and stay open (the output says how many). |
+| 0 ohm resistors as the last resort | Single sided only, on by default (`--no-jumpers`, `--jumper-sizes 0805,1206`, default 0402,0603,0805,1206). A connection that has no path at all is routed again with hops: two pads of a 0402, 0603, 0805 or 1206 resistor (smallest that fits) on both sides of the traces in the way. The traces pass under the body between the pads, so the gap has to hold them with their clearance. The result is kept only if the exact pads keep all clearances. The Standard JSON output contains the parts (footprint with two pads on the net); every run also writes `<result>.jumpers.json` with net, size, position (mm and mil, y up) and angle. A Pro project gets the tracks up to the pad places but not the parts (a Pro part is a component that points at footprint and device documents inside the project, which this writer cannot create): place them from the list, which has the LCSC number of each part. Land patterns and parts (taken from the EasyEDA/LCSC footprints, all JLCPCB Basic 0 ohm): 0402 C17168 (pad pitch 0.866 mm, gap between the pads 0.30 mm), 0603 C21189 (1.507 / 0.70 mm), 0805 C17477 (2.000 / 0.87 mm), 1206 C17888 (2.958 / 1.75 mm). |
 | Widen power traces up to | Lets rails with a width grow into free space. Not needed when copper areas carry the current. |
 | Via cost | How much the router dislikes a via. Higher gives fewer vias and longer detours. |
 | Bridge split planes/nets with up to N vias | Joins planes or nets that end up in pieces, with at most this many new vias per bridge. Global, applies to all layers. |
 | Create copper areas for the nets assigned to a layer | The pours. They reach at most the given distance from the copper of their own net. |
 | Fill the empty space of every layer | Fills free room with the fill net (default GND) on all layers and adds stitching vias on the given pitch. |
 | Do not cut imported copper areas | Traces keep out of copper areas that are already in the project. |
-| Keep the existing tracks and vias in the saved file | EasyEDA JSON and Pro projects. Off (default): the saved file holds only the new routing, the existing tracks and vias are left out and shown ghosted in the preview. On: they stay in the file. For DSN files the same option writes them into the SES. |
-| Clean-up passes | Re-routes nets after the first pass to shorten traces and remove vias. |
+| Also write the existing wiring to the SES | DSN input only (`--include-existing`): the SES holds only the new routes unless this is on. An EasyEDA JSON or Pro file always keeps what is on the board. |
+| Clean-up passes | Re-routes nets after the first pass to shorten traces and remove vias (0.1 to 0.3 s on a 260 connection board; most of the run time is the first routing and the repair of connections that stay open). |
 | Route differential pairs together | Pairs (+/-, _P/_N, DP/DN) are routed side by side with a fixed gap. |
 | Last resorts | Jumps on plane layers, via inside a pad, and nudging small SMD parts (at most 3 part sizes, never ICs, connectors or through-hole parts). Only used for connections that stay open. |
 
 ## How it works
 
-The board is turned into a routing grid. Each net is routed with an A* search over all layers, with costs for vias, wrong layers and crossing other nets' areas. If a net does not fit, the nets in its way are ripped up and routed again, followed by regional repairs and, as a last step, a restart with the failing nets first. After routing, traces are smoothed and centred on pads, vias are merged where they would overlap, and the copper areas are traced from the free space of each layer with edges shared between neighbours. A separate DRC pass measures every clearance and checks that each net is connected.
+The board is turned into a routing grid. The grid is adaptive and not an option: 0.2 mm, or half the track pitch (width + clearance) of the design rules if that is smaller. Connections that stay open are searched again on finer local grids; if that is not enough, the whole board is routed again on a grid of a quarter of the pitch, and last with traces searched narrow first. Only the last run gets the full repair effort. Differential pairs are routed side by side with the clearance of their nets as the gap. Each net is routed with an A* search over all layers, with costs for vias, wrong layers and crossing other nets' areas. If a net does not fit, the nets in its way are ripped up and routed again, followed by regional repairs and, as a last step, a restart with the failing nets first. After routing, traces are smoothed and centred on pads, vias are merged where they would overlap, and the copper areas are traced from the free space of each layer with edges shared between neighbours. A separate DRC pass measures every clearance and checks that each net is connected.
 
 Open signal connections also get adaptive local searches at half and quarter of the main grid spacing, including during regional repairs. The search window grows to allow detours, with limits on memory and search work. Accepted routes retain their finer coordinates and must pass geometric clearance and connectivity checks; trace widths, via sizes and layer restrictions are preserved.
 

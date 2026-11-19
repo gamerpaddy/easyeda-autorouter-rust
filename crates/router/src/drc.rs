@@ -197,6 +197,17 @@ pub fn net_islands(r: &Router, ni: usize) -> Vec<Island> {
             uf[a] = b;
         }
     }
+    // the two pads of a jumper resistor are one piece electrically (the part joins them)
+    for j in &n.r.jumpers {
+        let [pa, pb] = j.pads(ni as i32, 0.0);
+        let find_pad = |p: &Prim| {
+            items.iter().position(|it| it.layer == p.layer && matches!((&it.geo, &p.geo), (Geo::Poly(a), Geo::Poly(b)) if a == b))
+        };
+        if let (Some(a), Some(b)) = (find_pad(&pa), find_pad(&pb)) {
+            let (a, b) = (find(&mut uf, a), find(&mut uf, b));
+            uf[a] = b;
+        }
+    }
     let mut groups: HashMap<usize, Island> = HashMap::new();
     let mut order_roots: Vec<usize> = vec![];
     for k in 0..n.pins.len() {
