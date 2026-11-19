@@ -221,6 +221,11 @@ pub struct Config {
     /// this many times the straight distance (plus 10 mm) long; only then it is narrowed
     /// (75 %, 50 %, minimum width). 0 = any detour is accepted before narrowing.
     pub max_detour: f64,
+    /// After routing, pull the traces tight: 0 = off, 1 = shortest path with 0/45/90 degree pieces,
+    /// 2 = shortest path at any angle. Every change is checked against the exact clearances.
+    pub tighten: u8,
+    /// No via nudging in this run (set for the trials of part nudging, which restore routes).
+    pub skip_via_nudge: bool,
     /// Less rescue effort (3 rounds, no regional rescue): for a run that is repeated with other
     /// settings when it leaves connections open. Set by the router itself.
     pub quick: bool,
@@ -290,7 +295,7 @@ impl Default for Config {
             fill_net: "GND".into(),
             nudge_parts: false,
             nudge_max_widths: 3.0,
-            nudge_attempts: 6,
+            nudge_attempts: 16,
             stitch_pitch_mm: 4.0,
             stitch_near_mm: 3.0,
             keep_track_widths: false,
@@ -300,6 +305,8 @@ impl Default for Config {
             narrow_first: false,
             fine_grid: false,
             quick: false,
+            skip_via_nudge: false,
+            tighten: 0,
             jumpers: true,
             jumper_sizes: vec!["0402".into(), "0603".into(), "0805".into(), "1206".into()],
             jumper_cost: 400.0,
@@ -851,6 +858,11 @@ pub struct Router {
     pub jcons: bool,
     /// jumper sizes in use (empty = no jumpers)
     pub jsizes: Vec<JSize>,
+    /// Escape cells of fine-pitch pads: a pad whose own cells are all blocked by the clearance to
+    /// its neighbours (the trace band along its centre line is narrower than the grid) gets cells
+    /// just outside it. cell -> (stub from the pad centre to the cell centre, pin). A path that
+    /// starts or ends there gets that stub.
+    pub escape: HashMap<Cell, (Vec<P>, usize)>,
     /// last-resort mode: the failing net may put vias inside its own pads
     pub pad_via_mode: bool,
     /// A* heuristic weight (1 = exact shortest path; larger = faster, a little longer)
@@ -1327,6 +1339,7 @@ impl Router {
             jump_mode: false,
             jumper_mode: false,
             jcons: false,
+            escape: HashMap::new(),
             jsizes,
             pad_via_mode: false,
             h_weight: h_weight(),
@@ -1383,6 +1396,9 @@ impl Router {
                     }
                 }
             }
+        }
+        if !light {
+            r.add_escape_cells();
         }
         r.init_components();
         if !light && r.cfg.trace_routing {
@@ -1506,6 +1522,29 @@ impl Router {
     }
     /// Sum over nets of the Euclidean minimum spanning tree of the pin centres: a (loose) lower
     /// bound on achievable wire length (a Steiner tree could be up to ~13% shorter).
+    /// The net has vias although all its pads are surface-mount pads on one and the same layer,
+    /// so a path without them may exist.
+    pub(crate) fn has_needless_via(&self, ni: usize) -> bool {
+        let n = &self.nets[ni];
+        if n.r.vias.is_empty() || n.pins.len() < 2 {
+            return false;
+        }
+        let mut layer: Option<usize> = None;
+        for &p in &n.pins {
+            let cells = &self.pins[p].cells;
+            let Some(first) = cells.first() else { return false };
+            if cells.iter().any(|c| c.0 != first.0) {
+                return false;
+            }
+            match layer {
+                None => layer = Some(first.0),
+                Some(l) if l != first.0 => return false,
+                _ => {}
+            }
+        }
+        !self.excl[layer.unwrap_or(0)]
+    }
+
     pub fn net_bound(&self, ni: usize) -> f64 {
         let n = &self.nets[ni];
         let mut total = 0.0;
@@ -2213,6 +2252,19 @@ impl Router {
             v.extend(b);
             (w, v)
         };
+        // a path that starts or ends on an escape cell of a fine-pitch pad reaches the pad with a stub
+        if !self.escape.is_empty() && !path.is_empty() {
+            let width = self.fields[self.nets[n].narrow_tf].p * 2.0;
+            for end in [path[0], path[path.len() - 1]] {
+                if let Some((pts, _)) = self.escape.get(&end).cloned() {
+                    if pts.len() >= 2
+                        && !self.nets[n].r.wires.iter().chain(wires.iter()).any(|w| w.layer == end.0 && w.pts == pts)
+                    {
+                        wires.push(Wire { fill: false, layer: end.0, width, pts });
+                    }
+                }
+            }
+        }
         let (clr, via_r) = (self.nets[n].clr, self.nets[n].via_r);
         let mut new_jumpers: Vec<Jumper> = vec![];
         for &i in &hops {
@@ -2575,7 +2627,8 @@ impl Router {
                 }
             }
             match path {
-                Some(p) => {
+                // a stub of a fine-pitch pad is checked against what is routed by now
+                Some(p) if self.escape_stubs_ok(n, &p) => {
                     self.commit_path(n, &p, requested_width);
                     tree.extend_from_slice(&p);
                     for &v in &self.nets[n].r.vias.clone() {
@@ -2588,7 +2641,7 @@ impl Router {
                     let add = self.nets[n].comps[c].clone();
                     conn_pins.extend(add);
                 }
-                None => failed.push(self.nets[n].comps[c][0]),
+                _ => failed.push(self.nets[n].comps[c][0]),
             }
             self.nets[n].width = requested_width;
         }
@@ -2698,6 +2751,229 @@ impl Router {
         self.stamp_dyn(&prims, -1);
         self.nets[n].r = Routed::default();
         self.route_net_plain(n, false);
+    }
+
+    /// Fine-pitch pads (QFN, 0.35 mm): the clearance to the neighbouring pads leaves a trace
+    /// only a narrow band along the centre line of the pad. When no grid cell of the pad lies in
+    /// that band, the pad has no cell a trace can start from and is never routed, although the
+    /// way out is free. Such a pad gets escape cells just outside it (free for the narrowest
+    /// trace, and a stub from the pad centre to the cell centre keeps the exact clearances);
+    /// a path that starts or ends there is completed with that stub in `commit_path`.
+    fn add_escape_cells(&mut self) {
+        let g = self.grid.clone();
+        let mut added = 0usize;
+        for n in 0..self.nets.len() {
+            if self.nets[n].skip || self.nets[n].pins.len() < 2 {
+                continue;
+            }
+            let pins: Vec<usize> = self.nets[n].pins.clone();
+            // only the nets that have such a pad pay for taking their own copper out of the fields
+            let blocked_pad = |me: &Router, pi: usize| -> bool {
+                let cells = &me.pins[pi].cells;
+                !cells.is_empty() && cells.iter().all(|&(l, x, y)| {
+                    let tn = &me.fields[me.nets[n].narrow_tf];
+                    let i = g.idx(l, x, y);
+                    // own copper still stamped: a cell is blocked by it only through the neighbours
+                    // when the whole pad is blocked, so this is a cheap pre-test
+                    tn.fx(i) || tn.dy(i)
+                })
+            };
+            if !pins.iter().any(|&pi| blocked_pad(self, pi)) {
+                continue;
+            }
+            self.stamp_net(n, -1);
+            let width = self.fields[self.nets[n].narrow_tf].p * 2.0;
+            let (clr, narrow) = (self.nets[n].clr, self.nets[n].narrow_tf);
+            for &pi in &pins {
+                let cells = self.pins[pi].cells.clone();
+                if cells.is_empty() || cells.iter().any(|c| c.0 != cells[0].0) {
+                    continue;
+                }
+                let l0 = cells[0].0;
+                let usable = {
+                    let tn = &self.fields[narrow];
+                    cells.iter().any(|&(l, x, y)| {
+                        let i = g.idx(l, x, y);
+                        !tn.fx(i) && !tn.dy(i)
+                    })
+                };
+                if usable {
+                    continue;
+                }
+                let c = self.pins[pi].c;
+                let mut bb = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+                for pr in self.pins[pi].prims.iter().filter(|p| p.layer == l0) {
+                    bb = (bb.0.min(pr.bb.0), bb.1.min(pr.bb.1), bb.2.max(pr.bb.2), bb.3.max(pr.bb.3));
+                }
+                if bb.0 > bb.2 {
+                    continue;
+                }
+                let (cx0, cy0) = g.cell((bb.0, bb.1));
+                let (cx1, cy1) = g.cell((bb.2, bb.3));
+                let mut cands: Vec<(f64, Cell, Vec<P>)> = vec![];
+                for y in (cy0 - 6).max(0)..=(cy1 + 6).min(g.ny as i32 - 1) {
+                    for x in (cx0 - 6).max(0)..=(cx1 + 6).min(g.nx as i32 - 1) {
+                        let i = g.idx(l0, x, y);
+                        let cc = g.center(x, y);
+                        if self.fields[narrow].fx(i) || self.fields[narrow].dy(i) {
+                            continue;
+                        }
+                        // a cell that already belongs to a pin (pad cell or escape cell) is not ours
+                        if self.escape.contains_key(&(l0, x, y)) || self.term.contains_key(&(l0, x, y)) {
+                            continue;
+                        }
+                        if self.pins[pi].prims.iter().any(|pr| pr.layer == l0 && pr.dist(cc) <= 1e-9) {
+                            continue;
+                        }
+                        // along the centre line of the pad first (between the neighbours), the
+                        // sideways step only where the cell is
+                        let q = if bb.2 - bb.0 >= bb.3 - bb.1 { (cc.0, c.1) } else { (c.0, cc.1) };
+                        let mut pts = vec![c];
+                        if dist(q, c) > 1e-9 {
+                            pts.push(q);
+                        }
+                        if dist(cc, *pts.last().unwrap()) > 1e-9 {
+                            pts.push(cc);
+                        }
+                        let prims: Vec<Prim> = pts
+                            .windows(2)
+                            .map(|w| Prim::new(l0, Geo::Seg { a: w[0], b: w[1], hw: width / 2.0 }, n as i32, clr))
+                            .collect();
+                        if !prims.is_empty() && self.prims_conflict(&prims).is_none() {
+                            cands.push((dist(c, cc), (l0, x, y), pts));
+                        }
+                    }
+                }
+                cands.sort_by(|a, b| a.0.total_cmp(&b.0));
+                for (_, cell, pts) in cands.into_iter().take(6) {
+                    self.pins[pi].cells.push(cell);
+                    self.escape.insert(cell, (pts, pi));
+                    self.term.entry(cell).or_insert(pi);
+                    added += 1;
+                }
+            }
+            self.stamp_net(n, 1);
+        }
+        if added > 0 && self.cfg.verbose {
+            eprintln!("escape cells: {added} cell(s) added for fine-pitch pads without a usable cell");
+        }
+    }
+
+    /// The stubs that `commit_path` adds where `path` starts or ends on an escape cell of a pad:
+    /// they must belong to a pad of net `n` and keep the exact clearances to everything routed
+    /// by now (the stub was checked when the cell was made, other copper has come since).
+    fn escape_stubs_ok(&self, n: usize, path: &[Cell]) -> bool {
+        if self.escape.is_empty() || path.is_empty() {
+            return true;
+        }
+        let width = self.fields[self.nets[n].narrow_tf].p * 2.0;
+        for end in [path[0], path[path.len() - 1]] {
+            if let Some((pts, pi)) = self.escape.get(&end) {
+                if self.pins[*pi].net != n as i32 {
+                    return false;
+                }
+                let prims: Vec<Prim> = pts
+                    .windows(2)
+                    .map(|w| Prim::new(end.0, Geo::Seg { a: w[0], b: w[1], hw: width / 2.0 }, n as i32, self.nets[n].clr))
+                    .collect();
+                if self.prims_conflict(&prims).is_some() {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Diagnostic: what the search sees around a pin. One character per grid cell on the pin's
+    /// layer, for the narrowest trace of its net with the net's own copper removed:
+    /// `P` pin copper, `#` blocked by fixed copper (pads, holes, edge), `o` blocked by routed
+    /// copper, `.` free; `+` marks cells where the narrow trace field is free but the full-width
+    /// one is not.
+    pub fn debug_pin_map(&mut self, name: &str, rx: i32, ry: i32) -> String {
+        let Some(pi) = self.pins.iter().position(|p| p.name.eq_ignore_ascii_case(name)) else {
+            return format!("no pin {name}");
+        };
+        let n = self.pins[pi].net;
+        if n < 0 {
+            return format!("pin {name} has no net");
+        }
+        let n = n as usize;
+        self.stamp_net(n, -1);
+        let cells = self.pins[pi].cells.clone();
+        let mut out = format!(
+            "pin {name} of {}: {} cell(s), grid {:.4}, trace width {:.3}, narrowest {:.3}, clearance {:.3}
+",
+            self.nets[n].name,
+            cells.len(),
+            self.grid.g,
+            self.nets[n].width,
+            self.fields[self.nets[n].narrow_tf].p * 2.0,
+            self.nets[n].clr
+        );
+        if let Some(&(l0, cx, cy)) = cells.first() {
+            let tn = &self.fields[self.nets[n].narrow_tf];
+            let tf = &self.fields[self.nets[n].tf];
+            let on_pin = |l: usize, x: i32, y: i32| cells.iter().any(|&c| c == (l, x, y));
+            for y in (cy - ry)..=(cy + ry) {
+                let mut row = String::new();
+                for x in (cx - rx)..=(cx + rx) {
+                    if x < 0 || y < 0 || x >= self.grid.nx as i32 || y >= self.grid.ny as i32 {
+                        row.push(' ');
+                        continue;
+                    }
+                    let i = self.grid.idx(l0, x, y);
+                    row.push(if on_pin(l0, x, y) {
+                        'P'
+                    } else if tn.fx(i) {
+                        '#'
+                    } else if tn.dy(i) {
+                        'o'
+                    } else if tf.fx(i) || tf.dy(i) {
+                        '+'
+                    } else {
+                        '.'
+                    });
+                }
+                out.push_str(&row);
+                out.push_str("\n");
+            }
+        }
+        {
+            // how many cells of the pin can a trace start from (not blocked for the narrowest trace)?
+            let tn = &self.fields[self.nets[n].narrow_tf];
+            let usable = self.pins[pi].cells.iter().filter(|&&(l, x, y)| {
+                let i = self.grid.idx(l, x, y);
+                !tn.fx(i) && !tn.dy(i)
+            }).count();
+            let fixed = self.pins[pi].cells.iter().filter(|&&(l, x, y)| tn.fx(self.grid.idx(l, x, y))).count();
+            let routed = self.pins[pi].cells.iter().filter(|&&(l, x, y)| tn.dy(self.grid.idx(l, x, y))).count();
+            out.push_str(&format!("  cells a trace can start from: {} of {} ({} blocked by fixed copper, {} by routed copper)
+", usable, self.pins[pi].cells.len(), fixed, routed));
+        }
+        // can the search get from this pin to the other pins of its net in the final state?
+        let fi = (self.nets[n].narrow_tf, self.nets[n].vf);
+        let full = (0, 0, self.grid.nx as i32 - 1, self.grid.ny as i32 - 1);
+        let others: Vec<usize> = self.nets[n].pins.iter().copied().filter(|&q| q != pi).collect();
+        for q in others.iter().take(8) {
+            let (seeds, targets) = (self.pins[pi].cells.clone(), self.pins[*q].cells.clone());
+            let reach = self.reachable(fi, &seeds, &targets);
+            self.pop_budget = 0;
+            let path = self.full_search(fi, &seeds, &targets, full);
+            out.push_str(&format!(
+                "  to {}: flood {}, search {}
+",
+                self.pins[*q].name,
+                if reach { "reaches" } else { "blocked" },
+                match &path {
+                    Some(p) => format!("finds a path of {} cells, {} layer change(s)", p.len(), p.windows(2).filter(|w| w[0].0 != w[1].0).count()),
+                    None => "finds nothing".to_string(),
+                }
+            ));
+        }
+        out.push_str(&format!("unconnected pins of the net: {:?}
+", self.nets[n].unconnected.iter().map(|&p| self.pins[p].name.clone()).collect::<Vec<_>>()));
+        self.stamp_net(n, 1);
+        out
     }
 
     /// Last resort for connections that are still open: let the failing net push other nets
@@ -3167,6 +3443,25 @@ impl Router {
             .collect()
     }
 
+    /// The grid cells of the copper of a route (the seeds of later searches), on the current grid.
+    pub(crate) fn tree_from_copper(&self, r: &Routed) -> Vec<Cell> {
+        let mut v: Vec<Cell> = r
+            .dynp
+            .iter()
+            .filter(|p| !p.trace_only && !p.fill)
+            // only cells whose centre is on the copper: a seed beside it would start a wire that
+            // does not touch the route it is meant to join
+            .flat_map(|p| {
+                crate::prewire::prim_cells(&self.grid, p)
+                    .into_iter()
+                    .filter(move |&(_, x, y)| p.dist(self.grid.center(x, y)) <= 1e-9)
+            })
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
     /// Reuse routing from the same board before finishing, after a placement change.
     /// Pins and obstacle fields already describe the new layout. Drop moved-pad
     /// nets, their groups and routes that now fail clearance before stamping copper.
@@ -3183,8 +3478,11 @@ impl Router {
             if affected.contains(&n) { continue; }
             self.stamp_dyn(&state.0.dynp, 1);
             reused += usize::from(!state.0.dynp.is_empty());
+            // the cell data of the saved route belongs to the grid it was made on: rebuild it
+            let mut r = state.0.clone();
+            r.tree = self.tree_from_copper(&r);
             let net = &mut self.nets[n];
-            net.r = state.0.clone();
+            net.r = r;
             net.unconnected = state.1.clone();
             net.coupled = state.2;
             net.guided = state.3;
@@ -3238,6 +3536,11 @@ impl Router {
     fn last_resorts(&mut self) {
         self.jump_pass();
         self.jumper_pass();
+        // with the option to nudge: routed vias in the way are moved a little (only a few
+        // connections open: something small is stuck, which is what this is for)
+        if self.cfg.nudge_parts && !self.cfg.single_sided && !self.cfg.skip_via_nudge && self.unrouted_count() <= 8 {
+            self.nudge_vias();
+        }
     }
 
     /// Single sided boards, the very last resort: a connection with no path at all hops over the
@@ -3446,7 +3749,10 @@ impl Router {
                 // areas overlap are left for a later wave
                 let needs_look = |me: &Router, n: usize| {
                     !(me.nets[n].coupled || me.nets[n].guided)
-                        && !(me.nets[n].unconnected.is_empty() && me.wire_length(n) <= 1.10 * me.net_bound(n))
+                        && (!(me.nets[n].unconnected.is_empty() && me.wire_length(n) <= 1.10 * me.net_bound(n))
+                            // a layer change although every pad of the net is on the same layer:
+                            // the net is routed again, which keeps a via-free path when there is one
+                            || me.has_needless_via(n))
                 };
                 let mut first = None;
                 while i < order.len() {
@@ -3572,6 +3878,7 @@ impl Router {
         cfg.on_snapshot = None;
         cfg.snapshot_dir = None;
         cfg.verbose = false;
+        let same_grid = (self.grid.g - grid.g).abs() < 1e-12;
         Router {
             ground_fill_length: self.ground_fill_length,
             cfg,
@@ -3601,6 +3908,7 @@ impl Router {
             jump_mode: self.jump_mode,
             jumper_mode: self.jumper_mode,
             jcons: self.jcons,
+            escape: if same_grid { self.escape.clone() } else { HashMap::new() },
             jsizes: self.jsizes.clone(),
             pad_via_mode: self.pad_via_mode,
             h_weight: self.h_weight,

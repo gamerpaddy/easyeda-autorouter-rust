@@ -99,7 +99,18 @@ pub fn check(r: &Router) -> DrcReport {
             // the smallest island is the one that got cut off
             let small = isl.iter().min_by_key(|i| i.pins.len()).unwrap();
             open_pos.push((ni, r.pins[small.pins[0]].c));
-            open.push(format!("{} ({} islands)", r.nets[ni].name, isl.len()));
+            // which pads are cut off from each other (up to three per piece)
+            let pieces: Vec<String> = isl
+                .iter()
+                .map(|i| {
+                    let mut names: Vec<&str> = i.pins.iter().take(3).map(|&p| r.pins[p].name.as_str()).collect();
+                    if i.pins.len() > 3 {
+                        names.push("...");
+                    }
+                    names.join(",")
+                })
+                .collect();
+            open.push(format!("{} ({} islands: {})", r.nets[ni].name, isl.len(), pieces.join(" | ")));
         }
     }
     DrcReport {

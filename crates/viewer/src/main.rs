@@ -119,7 +119,7 @@ struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            version: 2,
+            version: 3,
             cfg: Config {
                 verbose: false,
                 ..Config::default()
@@ -210,6 +210,8 @@ impl Pad {
 enum Msg {
     Snap(Box<Snapshot>),
     Done(Box<RunResult>),
+    /// settings that were tried because connections stayed open (sent after `Done`)
+    Suggestions(Vec<router::suggest::Suggestion>),
 }
 
 /// One clickable line of the report.
@@ -230,7 +232,11 @@ struct RunResult {
     export_ok: bool,
     options: String,
     issues: Vec<Issue>,
-
+    /// other settings are being tested (connections stayed open); `Msg::Suggestions` follows
+    suggesting: bool,
+    suggestions: Vec<router::suggest::Suggestion>,
+    /// open connections of this run
+    open_before: usize,
 }
 
 /// Ear-clipping triangulation of a simple polygon (indices into `pts`).
@@ -291,6 +297,8 @@ struct App {
     rx: Option<mpsc::Receiver<Msg>>,
     cancel: Arc<AtomicBool>,
     running: bool,
+    /// suggestions for open connections are being computed
+    suggesting: bool,
     snaps: Vec<Snapshot>,
     cur: usize,
     follow: bool,
@@ -324,6 +332,8 @@ struct App {
     saved_json: String,
     /// spot to highlight (clicked report line)
     focus: Option<(f64, f64)>,
+    /// egui time at which the crosshair was placed; it fades away after 10 seconds
+    focus_since: f64,
     canvas_rect: egui::Rect,
 }
 
@@ -378,6 +388,10 @@ impl App {
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
         let mut cfg = st.cfg.clone();
+        if st.version < 3 {
+            // nudging used to try 6 moves, which rarely got anywhere
+            cfg.nudge_attempts = Config::default().nudge_attempts;
+        }
         if st.version < 2 {
             cfg.plane_reach_mm = Config::default().plane_reach_mm;
             cfg.plane_jump_mm = Config::default().plane_jump_mm;
@@ -401,6 +415,7 @@ impl App {
             boards: st.boards,
             saved_json: String::new(),
             focus: None,
+            focus_since: 0.0,
             canvas_rect: egui::Rect::NOTHING,
             path: st.last_path.clone(),
             board: None,
@@ -412,6 +427,7 @@ impl App {
             rx: None,
             cancel: Arc::new(AtomicBool::new(false)),
             running: false,
+            suggesting: false,
             snaps: vec![],
             cur: 0,
             follow: true,
@@ -442,6 +458,8 @@ impl App {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| path.to_string());
         let path = abs.as_str();
+        // loading or reloading a board removes the crosshair of the previous one
+        self.focus = None;
         let is_pro = path.to_lowercase().ends_with(".epro2") || path.to_lowercase().ends_with(".epro");
         let raw = match std::fs::read(path) {
             Ok(b) => b,
@@ -640,7 +658,7 @@ impl App {
         cfg.exclusive_planes.clear();
         cfg.unit_mm = None;
         serde_json::to_string_pretty(&Settings {
-            version: 2,
+            version: 3,
             cfg,
             unit: self.unit,
             show_pads: self.show_pads,
@@ -702,6 +720,7 @@ impl App {
         std::thread::spawn(move || {
             let parts = doc.as_ref().map(|d| router::nudge::specs_from_doc(d)).unwrap_or_default();
             let skip: Vec<(String, String)> = doc.as_ref().map(|d| d.areas.iter().cloned().collect()).unwrap_or_default();
+            let base_cfg = cfg.clone();
             let solved = router::nudge::solve(&board, cfg, &parts, &skip);
             let nudge_log = solved.log.clone();
             let r = solved.router;
@@ -839,6 +858,12 @@ impl App {
                     st.tracks, st.vias, st.areas
                 );
             }
+            let open_before = r.unrouted_count().max(rep.open_nets.len());
+            let mut open_nets: Vec<String> = rep.open_nets.iter().map(|o| o.split(" (").next().unwrap_or(o).to_string()).collect();
+            open_nets.extend(r.nets.iter().filter(|n| !n.unconnected.is_empty() && !n.skip).map(|n| n.name.clone()));
+            open_nets.sort();
+            open_nets.dedup();
+            let suggesting = open_before > 0;
             let _ = tx.send(Msg::Done(Box::new(RunResult {
                 json: json.map(|j| j.0),
                 pro,
@@ -847,7 +872,15 @@ impl App {
                 export_ok,
                 options: serde_json::to_string_pretty(&r.cfg).unwrap_or_default(),
                 issues,
+                suggesting,
+                suggestions: vec![],
+                open_before,
             })));
+            if suggesting {
+                // connections stay open: try other settings and report the ones that help
+                let found = router::suggest::suggest(&board, &base_cfg, &parts, &skip, open_before, &open_nets, 4);
+                let _ = tx.send(Msg::Suggestions(found));
+            }
         });
     }
 
@@ -875,7 +908,19 @@ impl App {
                         }
                     }
                     Msg::Done(r) => {
+                        self.suggesting = r.suggesting;
                         self.result = Some(*r);
+                        self.running = false;
+                        if !self.suggesting {
+                            done = true;
+                        }
+                    }
+                    Msg::Suggestions(v) => {
+                        if let Some(r) = &mut self.result {
+                            r.suggestions = v;
+                            r.suggesting = false;
+                        }
+                        self.suggesting = false;
                         done = true;
                     }
                 }
@@ -883,6 +928,10 @@ impl App {
         }
         if done {
             self.running = false;
+            self.suggesting = false;
+            if let Some(r) = &mut self.result {
+                r.suggesting = false;
+            }
             self.rx = None;
         }
     }
@@ -1161,6 +1210,16 @@ impl App {
                 .response
                 .on_hover_text("A trace may be this many times (plus 10 mm) longer than the straight distance to stay at full width. Longer: it is narrowed instead. 0 = any detour.");
                 ui.horizontal(|ui| {
+                    let mut on = self.cfg.tighten > 0;
+                    if ui.checkbox(&mut on, "Pull traces tight after routing").on_hover_text("Every trace is pulled to the shortest path around what is in the way, checked against the exact clearances. Ends, vias and junctions stay where they are.").changed() {
+                        self.cfg.tighten = if on { 1 } else { 0 };
+                    }
+                    ui.add_enabled_ui(self.cfg.tighten > 0, |ui| {
+                        ui.selectable_value(&mut self.cfg.tighten, 1, "45° steps").on_hover_text("Pieces at 0, 45 and 90 degrees only.");
+                        ui.selectable_value(&mut self.cfg.tighten, 2, "any angle").on_hover_text("Free angles: the shortest possible path, a little shorter than with 45 degree steps.");
+                    });
+                });
+                ui.horizontal(|ui| {
                     ui.label("Widen power traces up to");
                     ui.add(egui::DragValue::new(&mut self.cfg.power_width_max_mm).range(0.0..=20.0).speed(0.1).suffix(" mm"));
                 })
@@ -1271,6 +1330,12 @@ impl App {
                         })
                         .response
                         .on_hover_text("How far a part may end up from where it started, measured in its own size (its longest side). 3 is the maximum.");
+                        ui.horizontal(|ui| {
+                            ui.label("Try at most");
+                            ui.add(egui::DragValue::new(&mut self.cfg.nudge_attempts).range(1..=100).speed(0.2).suffix(" moves"));
+                        })
+                        .response
+                        .on_hover_text("Every move re-routes what it touches. The search stops at the first layout without open connections, after this many moves or after five minutes.");
                     });
                 }
             });
@@ -1859,7 +1924,14 @@ impl App {
                     }
                 }
                 Some(s) => {
-                    for (net, pin) in &s.unrouted {
+                    // every cut-off piece joined to the nearest piece that is connected ...
+                    for (net, a, b2) in &s.airwires {
+                        if !skipped(*net) {
+                            painter.line_segment([tr(a.0, a.1), tr(b2.0, b2.1)], white);
+                        }
+                    }
+                    // ... and the simple line for the open nets that have none
+                    for (net, pin) in s.unrouted.iter().filter(|(net, _)| !s.airwires.iter().any(|w| w.0 == *net)) {
                         if let (Some(a), Some(first)) = (
                             moved_positions.get(pin.as_str()).or_else(|| self.pin_pos.get(pin)),
                             board.nets[*net]
@@ -1877,14 +1949,23 @@ impl App {
             }
         }
         if let Some(f) = self.focus {
-            let c = tr(f.0, f.1);
-            let pulse = (ctx.input(|i| i.time) * 3.0).sin() as f32 * 4.0;
-            for (rad, w) in [(22.0 + pulse, 3.0), (34.0 + pulse, 1.5)] {
-                painter.circle_stroke(c, rad, Stroke::new(w, Color32::from_rgb(255, 60, 200)));
+            // shown for 10 seconds after the click, then fades out over two more
+            let now = ctx.input(|i| i.time);
+            let age = now - self.focus_since;
+            if age >= 12.0 {
+                self.focus = None;
+            } else {
+                let alpha = if age <= 10.0 { 255 } else { (255.0 * (12.0 - age) / 2.0).clamp(0.0, 255.0) as u8 };
+                let colour = Color32::from_rgba_unmultiplied(255, 60, 200, alpha);
+                let c = tr(f.0, f.1);
+                let pulse = (now * 3.0).sin() as f32 * 4.0;
+                for (rad, w) in [(22.0 + pulse, 3.0), (34.0 + pulse, 1.5)] {
+                    painter.circle_stroke(c, rad, Stroke::new(w, colour));
+                }
+                painter.line_segment([c - egui::vec2(46.0, 0.0), c - egui::vec2(12.0, 0.0)], Stroke::new(1.5, colour));
+                painter.line_segment([c + egui::vec2(12.0, 0.0), c + egui::vec2(46.0, 0.0)], Stroke::new(1.5, colour));
+                ctx.request_repaint();
             }
-            painter.line_segment([c - egui::vec2(46.0, 0.0), c - egui::vec2(12.0, 0.0)], Stroke::new(1.5, Color32::from_rgb(255, 60, 200)));
-            painter.line_segment([c + egui::vec2(12.0, 0.0), c + egui::vec2(46.0, 0.0)], Stroke::new(1.5, Color32::from_rgb(255, 60, 200)));
-            ctx.request_repaint();
         }
         if let Some(l) = self.view_layer {
             painter.text(
@@ -2082,7 +2163,11 @@ impl eframe::App for App {
                 self.side_panel(ui);
             });
 
-        egui::Panel::bottom("timeline").show(ui, |ui| {
+        egui::Panel::bottom("timeline")
+            .resizable(true)
+            .default_size(240.0)
+            .size_range(110.0..=900.0)
+            .show(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui.button(if self.playing { "⏸" } else { "▶" }).clicked() {
                     self.playing = !self.playing;
@@ -2118,44 +2203,86 @@ impl eframe::App for App {
             }
             if self.running {
                 ui.label("routing…");
+            } else if self.suggesting {
+                ui.label("connections stay open: testing other settings …");
             }
             let mut jump: Option<((f64, f64), Option<usize>)> = None;
-            if let Some(r) = &self.result {
+            let mut apply: Option<Vec<router::suggest::Change>> = None;
+            if self.result.is_some() {
                 ui.separator();
-                if ui.button("Copy log").clicked() {
-                    let mut log = format!("Board: {}\n{}", self.path, r.text);
-                    for issue in &r.issues { log.push_str(&format!("{}\n", issue.text)); }
-                    log.push_str("\nRouting progress:\n");
-                    for snap in &self.snaps { log.push_str(&format!("{:.1}s: {} ({}/{})\n", snap.elapsed, snap.label, snap.routed, snap.connections)); }
-                    log.push_str(&format!("\nOptions used for this run:\n{}", r.options));
-                    ui.ctx().copy_text(log);
+                // two tiles, the divider can be dragged: the log on the left, the clickable
+                // lines (clearance, open nets) on the right
+                if self.result.as_ref().is_some_and(|r| !r.issues.is_empty()) {
+                    egui::Panel::right("issues_tile")
+                        .resizable(true)
+                        .default_size(520.0)
+                        .size_range(160.0..=2000.0)
+                        .show(ui, |ui| {
+                            ui.label("Click a line to show it on the board:");
+                            egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+                                if let Some(r) = &self.result {
+                                    for is in &r.issues {
+                                        let c = if is.error {
+                                            Color32::from_rgb(255, 110, 110)
+                                        } else {
+                                            Color32::from_rgb(255, 200, 90)
+                                        };
+                                        let txt = egui::RichText::new(format!("{} {}", if is.error { "⛔" } else { "⚠" }, is.text))
+                                            .color(c)
+                                            .monospace();
+                                        if ui.add(egui::Label::new(txt).sense(egui::Sense::click())).on_hover_text("show on board").clicked() {
+                                            jump = Some((is.pos, is.net));
+                                        }
+                                    }
+                                }
+                            });
+                        });
                 }
-                ui.monospace(&r.text);
-                if !r.issues.is_empty() {
-                    ui.label("Click a line to show it on the board:");
-                    egui::ScrollArea::vertical().max_height(130.0).show(ui, |ui| {
-                        for is in &r.issues {
-                            let c = if is.error {
-                                Color32::from_rgb(255, 110, 110)
-                            } else {
-                                Color32::from_rgb(255, 200, 90)
-                            };
-                            let txt = egui::RichText::new(format!(
-                                "{} {}",
-                                if is.error { "⛔" } else { "⚠" },
-                                is.text
-                            ))
-                            .color(c)
-                            .monospace();
-                            if ui.add(egui::Label::new(txt).sense(egui::Sense::click())).on_hover_text("show on board").clicked() {
-                                jump = Some((is.pos, is.net));
-                            }
+                egui::CentralPanel::default().show(ui, |ui| {
+                    if let Some(r) = &self.result {
+                        if ui.button("Copy log").clicked() {
+                            let mut log = format!("Board: {}\n{}", self.path, r.text);
+                            for issue in &r.issues { log.push_str(&format!("{}\n", issue.text)); }
+                            for s in &r.suggestions { log.push_str(&format!("suggestion: {}\n", s.text())); }
+                            log.push_str("\nRouting progress:\n");
+                            for snap in &self.snaps { log.push_str(&format!("{:.1}s: {} ({}/{})\n", snap.elapsed, snap.label, snap.routed, snap.connections)); }
+                            log.push_str(&format!("\nOptions used for this run:\n{}", r.options));
+                            ui.ctx().copy_text(log);
                         }
-                    });
+                        egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+                            // what to do about open connections comes first, the log below it
+                            if r.suggesting {
+                                ui.colored_label(Color32::from_rgb(255, 200, 90), format!("{} connection(s) stay open: testing other settings (up to two minutes) …", r.open_before));
+                            } else if r.open_before > 0 && r.suggestions.is_empty() {
+                                ui.colored_label(Color32::from_rgb(255, 200, 90), format!("{} connection(s) stay open. None of the other settings that were tried routes more. Try: a different layer plan (fewer nets on shared plane layers), more space between parts, more layers.", r.open_before));
+                            }
+                            if !r.suggestions.is_empty() {
+                                ui.strong("Other settings that were tested (each one routes more):");
+                                for s in &r.suggestions {
+                                    ui.horizontal_wrapped(|ui| {
+                                        if ui.button("Apply").on_hover_text("changes the setting; press Route to run again").clicked() {
+                                            apply = Some(s.changes.clone());
+                                        }
+                                        ui.label(s.text());
+                                    });
+                                }
+                                ui.separator();
+                            }
+                            ui.monospace(&r.text);
+                        });
+                    }
+                });
+            }
+            if let Some(changes) = apply {
+                for c in &changes {
+                    c.apply(&mut self.cfg);
                 }
+                self.dirty_preview = true;
+                self.msg = "Settings changed as suggested. Press Route to run again.".into();
             }
             if let Some((pos, net)) = jump {
                 self.focus = Some(pos);
+                self.focus_since = ui.ctx().input(|i| i.time);
                 self.sel_net = net;
                 self.view_layer = None;
                 let rect = self.canvas_rect;
@@ -2295,10 +2422,14 @@ fn main() -> eframe::Result {
         let last = app.path.clone();
         app.load(&last);
     }
+    if args.iter().any(|a| a == "--route") && app.board.is_some() {
+        // start routing as soon as the window opens
+        app.start();
+    }
     if args.iter().any(|a| a == "--selftest") {
         // run the GUI's background routing path without a window
         app.start();
-        while app.running {
+        while app.running || app.suggesting {
             std::thread::sleep(std::time::Duration::from_millis(50));
             app.poll();
         }
@@ -2306,6 +2437,12 @@ fn main() -> eframe::Result {
         if let Some(r) = &app.result {
             print!("{}", r.text);
             println!("SES bytes: {}", r.ses.len());
+            for i in r.issues.iter().filter(|i| i.text.starts_with("open:")) {
+                println!("{}", i.text);
+            }
+            for s in &r.suggestions {
+                println!("suggestion: {}", s.text());
+            }
         }
         return Ok(());
     }

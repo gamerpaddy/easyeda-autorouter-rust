@@ -467,7 +467,9 @@ pub(crate) fn trace_chains(lab: &[u8], nx: usize, ny: usize) -> Vec<Chain> {
 
 /// Octilinear simplification of an open chain of lattice points: the ends stay, every piece is
 /// horizontal, vertical or diagonal and no skipped point is farther than `tol` from it.
-pub(crate) fn simplify_open(pts: &[(i32, i32)], tol: f64) -> Vec<(i32, i32)> {
+/// The tolerance depends on the skipped point: fine near a via or pad that needs it, coarse
+/// everywhere else on the same boundary.
+pub(crate) fn simplify_open_var(pts: &[(i32, i32)], tol_of: &dyn Fn((i32, i32)) -> f64) -> Vec<(i32, i32)> {
     let n = pts.len();
     if n < 3 {
         return pts.to_vec();
@@ -488,7 +490,7 @@ pub(crate) fn simplify_open(pts: &[(i32, i32)], tol: f64) -> Vec<(i32, i32)> {
         while j < n && miss <= 64 {
             let (a, b) = (pts[i], pts[j]);
             let (dx, dy) = ((b.0 - a.0).abs(), (b.1 - a.1).abs());
-            if (dx == 0 || dy == 0 || dx == dy) && (i + 1..j).all(|m| dev(pts[m], a, b) <= tol) {
+            if (dx == 0 || dy == 0 || dx == dy) && (i + 1..j).all(|m| dev(pts[m], a, b) <= tol_of(pts[m])) {
                 best = j;
                 miss = 0;
             } else {

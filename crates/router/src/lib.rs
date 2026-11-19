@@ -11,5 +11,6 @@ pub mod prewire;
 pub mod nudge;
 pub mod ses;
 pub mod snapshot;
+pub mod suggest;
 pub use engine::*;
 pub mod finish;

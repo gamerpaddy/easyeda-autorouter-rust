@@ -17,6 +17,13 @@ pub fn octilinear(a: P, b: P) -> Vec<P> {
 
 use std::collections::HashMap;
 
+/// The last piece of a wire that ends in a via that is being moved.
+struct ViaStub {
+    layer: usize,
+    from: P,
+    width: f64,
+}
+
 impl Router {
     fn wire_prims(&self, n: usize, w: &Wire) -> Vec<Prim> {
         w.pts
@@ -98,6 +105,12 @@ impl Router {
         let _t = std::time::Instant::now();
         self.repair_trace_clearance();
         if self.cfg.verbose { eprintln!("finish: repair_trace_clearance {:.2}s", _t.elapsed().as_secs_f32()); }
+        // optional: pull the traces tight (shortest path), before widths and pours are made
+        if self.cfg.tighten > 0 {
+            let _t = std::time::Instant::now();
+            self.tighten_traces();
+            if self.cfg.verbose { eprintln!("finish: tighten_traces {:.2}s", _t.elapsed().as_secs_f32()); }
+        }
         if self.cfg.pour_polygons {
             // copper areas are cut around the final copper, so widths are final before they are made
             let _t = std::time::Instant::now();
@@ -1165,9 +1178,20 @@ impl Router {
             }
             let chains = crate::outline::trace_chains(&lab, nx, ny);
             let to_pt = |&(x, y): &(i32, i32)| -> P { (g.x0 + (x as f64 - 0.5) * g.g, g.y0 + (y as f64 - 0.5) * g.g) };
-            // the simplification tolerance of a chain halves every time a via needs it finer
+            // The simplification tolerance is coarse (a staircase of one block per step becomes one
+            // 45 degree line) and halves, only around the spot, every time a via or pad there is
+            // not covered: `zones` holds (centre, level) of such spots per boundary.
             let base_tol = 1.2 * b as f64;
-            let mut level = vec![0u32; chains.len()];
+            let zone_r = 3 * b as i32;
+            let mut zones: Vec<Vec<((i32, i32), u32)>> = vec![vec![]; chains.len()];
+            let level_at = |zones: &Vec<((i32, i32), u32)>, q: (i32, i32)| -> u32 {
+                zones
+                    .iter()
+                    .filter(|(c, _)| (c.0 - q.0).abs() <= zone_r && (c.1 - q.1).abs() <= zone_r)
+                    .map(|z| z.1)
+                    .max()
+                    .unwrap_or(0)
+            };
             let covered = |rings: &Vec<Vec<Vec<(i32, i32)>>>, k: usize, p: P| -> bool {
                 rings[k]
                     .iter()
@@ -1177,13 +1201,17 @@ impl Router {
                     == 1
             };
             let mut rings: Vec<Vec<Vec<(i32, i32)>>> = vec![];
-            for _round in 0..40 {
+            for _round in 0..60 {
                 let mut simp: Vec<Vec<(i32, i32)>> = vec![vec![]; chains.len()];
                 for (i, c) in chains.iter().enumerate() {
                     if c.master == i {
-                        let t = if c.nbr == u8::MAX { base_tol * 0.25 } else { base_tol };
-                        let tol = if level[i] >= 5 { 0.0 } else { t / (1u32 << level[i]) as f64 };
-                        simp[i] = crate::outline::simplify_open(&c.pts, tol);
+                        // a boundary to nothing needs less care than one shared with another area
+                        let t = if c.nbr == u8::MAX { base_tol * 0.75 } else { base_tol };
+                        let zs = &zones[i];
+                        simp[i] = crate::outline::simplify_open_var(&c.pts, &|q| {
+                            let lv = level_at(zs, q);
+                            if lv >= 5 { 0.0 } else { t / (1u32 << lv) as f64 }
+                        });
                     }
                 }
                 for (i, c) in chains.iter().enumerate() {
@@ -1194,7 +1222,7 @@ impl Router {
                     }
                 }
                 rings = crate::outline::assemble_rings(&chains, &simp, kn);
-                // points of vias / pads that the areas fail to cover make the chains near them finer
+                // points of vias / pads that the areas fail to cover make the boundary near them finer
                 let mut worse = false;
                 for k in 0..kn {
                     let polys: Vec<Vec<P>> = rings[k].iter().map(|r| r.iter().map(to_pt).collect()).collect();
@@ -1203,13 +1231,25 @@ impl Router {
                         if inside {
                             continue;
                         }
-                        // only the boundary closest to the point gets finer
-                        let nearest = (0..chains.len())
-                            .filter(|&i| level[chains[i].master] < 5)
-                            .map(|i| (i, chains[i].pts.iter().map(|q| dist(to_pt(q), p)).fold(f64::MAX, f64::min)))
-                            .min_by(|a, b| a.1.total_cmp(&b.1));
-                        if let Some((i, _)) = nearest {
-                            level[chains[i].master] += 1;
+                        // only the boundary point closest to the spot gets finer
+                        let mut nearest: Option<(usize, (i32, i32), f64)> = None;
+                        for (i, c) in chains.iter().enumerate() {
+                            for q in &c.pts {
+                                if level_at(&zones[c.master], *q) >= 5 {
+                                    continue;
+                                }
+                                let d = dist(to_pt(q), p);
+                                if nearest.as_ref().is_none_or(|n| d < n.2) {
+                                    nearest = Some((i, *q, d));
+                                }
+                            }
+                        }
+                        if let Some((i, q, _)) = nearest {
+                            let z = &mut zones[chains[i].master];
+                            match z.iter_mut().find(|(c, _)| (c.0 - q.0).abs() <= zone_r && (c.1 - q.1).abs() <= zone_r) {
+                                Some(zz) => zz.1 += 1,
+                                None => z.push((q, 1)),
+                            }
                             worse = true;
                         }
                     }
@@ -1866,7 +1906,666 @@ impl Router {
         }
     }
 
-    fn rebuild_route_prims(&mut self, n: usize) {
+    /// Pull every routed wire tight (`cfg.tighten`): vertices that can be bypassed with a straight
+    /// piece are dropped and the others slide toward the line between their neighbours as far as
+    /// the exact clearances allow, which is the shortest path around what is in the way. With
+    /// `tighten == 1` the result is then cut into 0/45/90 degree pieces; a wire for which that
+    /// does not fit keeps its old shape. Ends, vias and the points where another wire attaches
+    /// never move.
+    pub(crate) fn tighten_traces(&mut self) {
+        let mode = self.cfg.tighten;
+        if mode == 0 {
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        let (mut shortened, mut saved_len) = (0usize, 0.0f64);
+        for n in 0..self.nets.len() {
+            if self.cancelled() {
+                return;
+            }
+            if self.nets[n].coupled || self.nets[n].guided || self.nets[n].skip {
+                continue;
+            }
+            let old = self.nets[n].r.wires.clone();
+            // points of this net that must stay: ends of wires, vias
+            let mut fixed: Vec<(usize, P)> = vec![];
+            for w in old.iter().filter(|w| !w.fill) {
+                fixed.push((w.layer, w.pts[0]));
+                fixed.push((w.layer, *w.pts.last().unwrap()));
+            }
+            for &v in &self.nets[n].r.vias {
+                for l in 0..self.grid.nl {
+                    fixed.push((l, v));
+                }
+            }
+            let mut own_copper: Vec<Prim> = vec![];
+            for &pi in &self.nets[n].pins {
+                own_copper.extend(self.pins[pi].prims.iter().cloned());
+            }
+            own_copper.extend(self.nets[n].pre.dynp.iter().filter(|p| !p.trace_only).cloned());
+            for j in &self.nets[n].r.jumpers {
+                own_copper.extend(j.pads(n as i32, 0.0));
+            }
+            let mut result = old.clone();
+            let mut changed = false;
+            for (wi, w) in old.iter().enumerate() {
+                if w.fill || w.pts.len() < 3 {
+                    continue;
+                }
+                // something attached in the middle of a piece: leave the wire alone
+                let attached_inside = fixed.iter().any(|(l, p)| {
+                    *l == w.layer
+                        && w.pts.windows(2).any(|s| dist_pt_seg(*p, s[0], s[1]) < 1e-6 && dist(*p, s[0]) > 1e-6 && dist(*p, s[1]) > 1e-6)
+                });
+                if attached_inside {
+                    continue;
+                }
+                let is_fixed = |i: usize| -> bool {
+                    i == 0 || i + 1 == w.pts.len() || fixed.iter().any(|(l, p)| *l == w.layer && dist(*p, w.pts[i]) < 1e-6)
+                };
+                let before: f64 = w.pts.windows(2).map(|s| dist(s[0], s[1])).sum();
+                // copper of this net that the wire touches on its way (a pad it passes over, existing
+                // wiring, a jumper pad): it has to be touched afterwards as well
+                let touching: Vec<Prim> = own_copper
+                    .iter()
+                    .filter(|c| c.layer == w.layer && self.wire_touches(n, w, &w.pts, c))
+                    .cloned()
+                    .collect();
+                let mut pts = self.tighten_pts(n, w, &is_fixed);
+                if mode == 1 {
+                    match self.octilinear_pts(n, w, &pts) {
+                        Some(p) => pts = p,
+                        None => continue,
+                    }
+                }
+                if touching.iter().any(|c| !self.wire_touches(n, w, &pts, c)) {
+                    continue;
+                }
+                let after: f64 = pts.windows(2).map(|s| dist(s[0], s[1])).sum();
+                if after < before - 1e-6 && pts.len() >= 2 {
+                    saved_len += before - after;
+                    shortened += 1;
+                    result[wi].pts = pts;
+                    changed = true;
+                }
+            }
+            if changed {
+                self.stamp_net(n, -1);
+                self.nets[n].r.wires = result;
+                self.rebuild_route_prims(n);
+                self.stamp_net(n, 1);
+            }
+        }
+        if self.cfg.verbose {
+            eprintln!(
+                "tighten: {} wire(s) shortened by {:.1} in total ({:.2}s)",
+                shortened,
+                saved_len,
+                t0.elapsed().as_secs_f32()
+            );
+        }
+    }
+
+    /// Does the polyline `pts` (width and layer of `w`) touch the copper `c`?
+    fn wire_touches(&self, n: usize, w: &Wire, pts: &[P], c: &Prim) -> bool {
+        pts.windows(2).any(|s| {
+            let seg = Prim::new(w.layer, Geo::Seg { a: s[0], b: s[1], hw: w.width / 2.0 }, n as i32, 0.0);
+            seg.gap(c) <= 1e-6
+        })
+    }
+
+    /// Is the straight piece a-b of wire `w` (same layer and width) free of conflicts?
+    fn piece_ok(&self, n: usize, w: &Wire, a: P, b: P) -> bool {
+        let piece = Wire { fill: false, layer: w.layer, width: w.width, pts: vec![a, b] };
+        self.prims_conflict(&self.wire_prims(n, &piece)).is_none()
+    }
+
+    /// Taut-string version of the polyline of `w`, free angles.
+    fn tighten_pts(&self, n: usize, w: &Wire, is_fixed: &dyn Fn(usize) -> bool) -> Vec<P> {
+        let mut pts = w.pts.clone();
+        // the fixed flags travel with the vertices
+        let mut fix: Vec<bool> = (0..pts.len()).map(is_fixed).collect();
+        for _pass in 0..10 {
+            let mut improved = false;
+            // 1. bypass vertices with a straight piece
+            let mut i = 0;
+            while i + 2 < pts.len() {
+                // the farthest vertex that can be reached before the next fixed vertex
+                let mut jmax = pts.len() - 1;
+                for (k, f) in fix.iter().enumerate().skip(i + 1) {
+                    if *f {
+                        jmax = k;
+                        break;
+                    }
+                }
+                let mut j = jmax;
+                while j >= i + 2 {
+                    if self.piece_ok(n, w, pts[i], pts[j]) {
+                        pts.drain(i + 1..j);
+                        fix.drain(i + 1..j);
+                        improved = true;
+                        break;
+                    }
+                    j -= 1;
+                }
+                i += 1;
+            }
+            // 2. slide the others toward the line between their neighbours
+            for k in 1..pts.len().saturating_sub(1) {
+                if fix[k] {
+                    continue;
+                }
+                let (p, q, v) = (pts[k - 1], pts[k + 1], pts[k]);
+                // closest point of p-q to v
+                let (dx, dy) = (q.0 - p.0, q.1 - p.1);
+                let l2 = dx * dx + dy * dy;
+                if l2 < 1e-12 {
+                    continue;
+                }
+                let t = (((v.0 - p.0) * dx + (v.1 - p.1) * dy) / l2).clamp(0.0, 1.0);
+                let target = (p.0 + t * dx, p.1 + t * dy);
+                if dist(v, target) < 1e-6 {
+                    continue;
+                }
+                let at = |f: f64| (v.0 + f * (target.0 - v.0), v.1 + f * (target.1 - v.1));
+                let ok = |f: f64| {
+                    let c = at(f);
+                    self.piece_ok(n, w, p, c) && self.piece_ok(n, w, c, q)
+                };
+                let f = if ok(1.0) {
+                    1.0
+                } else {
+                    let (mut lo, mut hi) = (0.0, 1.0);
+                    for _ in 0..10 {
+                        let mid = (lo + hi) / 2.0;
+                        if ok(mid) {
+                            lo = mid;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    lo
+                };
+                if f > 1e-3 {
+                    pts[k] = at(f);
+                    improved = true;
+                }
+            }
+            if !improved {
+                break;
+            }
+        }
+        pts
+    }
+
+    /// The polyline `pts` (the tightened version of `w`) cut into 0/45/90 degree pieces; None
+    /// when a piece does not fit.
+    fn octilinear_pts(&self, n: usize, w: &Wire, pts: &[P]) -> Option<Vec<P>> {
+        let is_oct = |a: P, b: P| {
+            let (dx, dy) = ((b.0 - a.0).abs(), (b.1 - a.1).abs());
+            dx < 1e-6 || dy < 1e-6 || (dx - dy).abs() < 1e-6
+        };
+        let mut out = vec![pts[0]];
+        for s in pts.windows(2) {
+            let (a, b) = (s[0], s[1]);
+            if is_oct(a, b) {
+                out.push(b);
+                continue;
+            }
+            // the two ways round the corner: diagonal first or straight first
+            let first = octilinear(a, b);
+            let mut second = octilinear(b, a);
+            second.reverse();
+            let mut done = false;
+            for cand in [first, second] {
+                let piece = Wire { fill: false, layer: w.layer, width: w.width, pts: cand.clone() };
+                if self.prims_conflict(&self.wire_prims(n, &piece)).is_none() {
+                    out.extend(cand.into_iter().skip(1));
+                    done = true;
+                    break;
+                }
+            }
+            if !done {
+                return None;
+            }
+        }
+        Some(out)
+    }
+
+    /// Last resort for connections that stay open (with the option to nudge parts): routed vias of
+    /// other nets that stand near the gap between the pieces of an open net are moved a little,
+    /// one by one, in pairs or all together by the same offset (a via can only move together
+    /// with the wires that end in it), the exact clearances are checked, and the open net is
+    /// routed again. A move stays only when that net then connects; nothing else is re-routed.
+    pub(crate) fn nudge_vias(&mut self) {
+        let t0 = std::time::Instant::now();
+        let failing: Vec<usize> = (0..self.nets.len())
+            .filter(|&n| {
+                !self.nets[n].unconnected.is_empty()
+                    && !self.nets[n].skip
+                    && !self.nets[n].coupled
+                    && !self.nets[n].guided
+                    && self.nets[n].pair.is_none()
+                    && self.nets[n].bundle.is_none()
+            })
+            .collect();
+        for n in failing {
+            if self.cancelled() || t0.elapsed().as_secs() > 12 {
+                return;
+            }
+            if self.nets[n].unconnected.is_empty() {
+                continue;
+            }
+            let isl = crate::drc::net_islands(self, n);
+            if isl.len() < 2 {
+                continue;
+            }
+            // the shortest stretch between two pieces of the net
+            let mut best: Option<(f64, P, P)> = None;
+            for (i, a) in isl.iter().enumerate() {
+                for b in isl.iter().skip(i + 1) {
+                    for &pa in &a.pins {
+                        for &pb in &b.pins {
+                            let (ca, cb) = (self.pins[pa].c, self.pins[pb].c);
+                            let d = dist(ca, cb);
+                            if best.is_none_or(|x| d < x.0) {
+                                best = Some((d, ca, cb));
+                            }
+                        }
+                    }
+                }
+            }
+            let Some((_, a, b)) = best else { continue };
+            // first the way a person does it: lift the vias out, route, put them back
+            if self.push_vias_route(n) {
+                if self.cfg.verbose {
+                    eprintln!("vias pushed aside: {} is routed", self.nets[n].name);
+                }
+                continue;
+            }
+            // vias of other nets near it
+            let via_d = 2.0 * self.nets[n].via_r;
+            let reach = (3.0 / self.unit_mm.max(1e-12)).max(3.0 * via_d);
+            let mut near: Vec<(f64, usize, usize)> = vec![];
+            for m in 0..self.nets.len() {
+                if m == n || self.nets[m].coupled || self.nets[m].guided || self.nets[m].skip {
+                    continue;
+                }
+                for (vi, &v) in self.nets[m].r.vias.iter().enumerate() {
+                    let d = dist_pt_seg(v, a, b);
+                    if d < reach {
+                        near.push((d, m, vi));
+                    }
+                }
+            }
+            near.sort_by(|x, y| x.0.total_cmp(&y.0));
+            near.truncate(4);
+            if near.is_empty() {
+                continue;
+            }
+            // groups of vias moved by the same offset: each alone, every pair, all of them
+            let mut groups: Vec<Vec<(usize, usize)>> = near.iter().map(|&(_, m, vi)| vec![(m, vi)]).collect();
+            for i in 0..near.len() {
+                for j in i + 1..near.len() {
+                    groups.push(vec![(near[i].1, near[i].2), (near[j].1, near[j].2)]);
+                }
+            }
+            if near.len() > 2 {
+                groups.push(near.iter().map(|&(_, m, vi)| (m, vi)).collect());
+            }
+            'groups: for group in &groups {
+                for step_f in [0.25, 0.5, 0.75, 1.0] {
+                    for d in 0..8 {
+                        if self.cancelled() || t0.elapsed().as_secs() > 12 {
+                            return;
+                        }
+                        let ang = d as f64 * std::f64::consts::FRAC_PI_4;
+                        let off = (via_d * step_f * ang.cos(), via_d * step_f * ang.sin());
+                        if self.try_via_move(n, group, off) {
+                            if self.cfg.verbose {
+                                eprintln!(
+                                    "nudged {} via(s) by {:.2} mm: {} is routed",
+                                    group.len(),
+                                    via_d * step_f * self.unit_mm,
+                                    self.nets[n].name
+                                );
+                            }
+                            break 'groups;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Via nudging, the way a person does it. The routed vias of other nets near the gap of the
+    /// open net `n` are moved a little (the last piece of the wires that end in a via follows it)
+    /// and `n` is routed again in the room that is made. Orders tried, each checked against the
+    /// exact clearances, and only kept when `n` ends up connected (otherwise everything is put
+    /// back exactly as it was):
+    ///  1. every via stays as a smaller "ghost" while `n` is routed, so the path keeps off its
+    ///     centre, then each via is pushed out by just what is needed (ghost sizes 0.85, 0.6, 0.35);
+    ///  2. every via is moved just clear of the straight line between the two pieces of `n`, all
+    ///     to the same side of it, first one side, then the other;
+    ///  3. the vias are lifted out entirely, `n` is routed, the vias go back as near as possible.
+    pub(crate) fn push_vias_route(&mut self, n: usize) -> bool {
+        for ghost in [0.85, 0.6, 0.35] {
+            if self.push_vias_try(n, 3, ghost) {
+                return true;
+            }
+        }
+        self.push_vias_try(n, 0, 0.0) || self.push_vias_try(n, 1, 0.0) || self.push_vias_try(n, 2, 0.0)
+    }
+
+    /// Put a lifted via of net `m` (and the wire pieces `stubs` that end in it) at the nearest
+    /// place to `v` where it is clean; with `clear_of` = (a, b, distance, side), only places at
+    /// least that far from the segment a-b and on that side of the line (side 0: either). False
+    /// when there is none.
+    fn place_lifted_via(&mut self, m: usize, v: P, stubs: &[ViaStub], clear_of: Option<(P, P, f64, f64)>) -> bool {
+        let via_d = 2.0 * self.nets[m].via_r;
+        let mut spots: Vec<P> = vec![v];
+        for k in 1..=16 {
+            let ring = 0.1 * k as f64;
+            for d in 0..16 {
+                let ang = d as f64 * std::f64::consts::FRAC_PI_8;
+                spots.push((v.0 + via_d * ring * ang.cos(), v.1 + via_d * ring * ang.sin()));
+            }
+        }
+        let (clr, via_r) = (self.nets[m].clr, self.nets[m].via_r);
+        for p in spots {
+            if !point_in_poly(p, &self.boundary) {
+                continue;
+            }
+            if let Some((a, b, need, side)) = clear_of {
+                if dist_pt_seg(p, a, b) < need {
+                    continue;
+                }
+                let cross = (b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0);
+                if side != 0.0 && cross * side < 0.0 {
+                    continue;
+                }
+            }
+            let mut prims: Vec<Prim> = (0..self.grid.nl).map(|l| Prim::new(l, Geo::Circle { c: p, r: via_r }, m as i32, clr)).collect();
+            for s in stubs {
+                if dist(s.from, p) > 1e-9 {
+                    prims.push(Prim::new(s.layer, Geo::Seg { a: s.from, b: p, hw: s.width / 2.0 }, m as i32, clr));
+                }
+            }
+            if self.prims_conflict(&prims).is_some() {
+                continue;
+            }
+            self.stamp_net(m, -1);
+            self.nets[m].r.vias.push(p);
+            for s in stubs {
+                if dist(s.from, p) > 1e-9 {
+                    self.nets[m].r.wires.push(Wire { fill: false, layer: s.layer, width: s.width, pts: vec![s.from, p] });
+                }
+            }
+            self.rebuild_route_prims(m);
+            self.stamp_net(m, 1);
+            return true;
+        }
+        false
+    }
+
+    /// One order of `push_vias_route`: `strategy` 3 with a ghost size, 0 / 1 (one side / the other
+    /// side of the line), or 2 (lift, route, put back).
+    fn push_vias_try(&mut self, n: usize, strategy: u8, ghost: f64) -> bool {
+        let isl = crate::drc::net_islands(self, n);
+        if isl.len() < 2 {
+            return false;
+        }
+        // the shortest stretch between two pieces of the net
+        let mut best: Option<(f64, P, P)> = None;
+        for (i, a) in isl.iter().enumerate() {
+            for b in isl.iter().skip(i + 1) {
+                for &pa in &a.pins {
+                    for &pb in &b.pins {
+                        let (ca, cb) = (self.pins[pa].c, self.pins[pb].c);
+                        let d = dist(ca, cb);
+                        if best.is_none_or(|x| d < x.0) {
+                            best = Some((d, ca, cb));
+                        }
+                    }
+                }
+            }
+        }
+        let Some((_, a, b)) = best else { return false };
+        let reach = (3.0 / self.unit_mm.max(1e-12)).max(3.0 * 2.0 * self.nets[n].via_r);
+        // the nearest vias of other nets, and where they are (positions, not indices: indices move)
+        let mut near: Vec<(f64, usize, P)> = vec![];
+        for m in 0..self.nets.len() {
+            if m == n || self.nets[m].coupled || self.nets[m].guided || self.nets[m].skip || self.nets[m].pair.is_some() || self.nets[m].bundle.is_some() {
+                continue;
+            }
+            for &v in &self.nets[m].r.vias {
+                let d = dist_pt_seg(v, a, b);
+                if d < reach {
+                    near.push((d, m, v));
+                }
+            }
+        }
+        near.sort_by(|x, y| x.0.total_cmp(&y.0));
+        near.truncate(8);
+        if near.is_empty() {
+            return false;
+        }
+        // a wire that runs from one lifted via straight to another one would lose both of its ends
+        for &(_, m, v) in &near {
+            for w in self.nets[m].r.wires.iter().filter(|w| !w.fill && w.pts.len() == 2) {
+                let other = if dist(w.pts[0], v) < 1e-6 { Some(w.pts[1]) } else if dist(w.pts[1], v) < 1e-6 { Some(w.pts[0]) } else { None };
+                if let Some(o) = other {
+                    if near.iter().any(|&(_, m2, v2)| m2 == m && dist(v2, v) > 1e-6 && dist(v2, o) < 1e-6) {
+                        return false;
+                    }
+                }
+            }
+        }
+        let mut affected: Vec<usize> = near.iter().map(|x| x.1).collect();
+        affected.sort_unstable();
+        affected.dedup();
+        // everything that can change, to put it back exactly (copper, stamps, what is still open)
+        let saved: Vec<(usize, Routed, Vec<usize>)> =
+            affected.iter().map(|&m| (m, self.nets[m].r.clone(), self.nets[m].unconnected.clone())).collect();
+        let saved_n = (self.nets[n].r.clone(), self.nets[n].unconnected.clone());
+        // how many pieces each owner has now: moving a via must not cut a net in two
+        let pieces_before: Vec<(usize, usize)> = affected.iter().map(|&m| (m, crate::drc::net_islands(self, m).len())).collect();
+        let revert = |me: &mut Router| {
+            for (m, r, unc) in &saved {
+                let prims = std::mem::take(&mut me.nets[*m].r.dynp);
+                me.stamp_dyn(&prims, -1);
+                me.nets[*m].r = r.clone();
+                me.nets[*m].unconnected = unc.clone();
+                let prims = me.nets[*m].r.dynp.clone();
+                me.stamp_dyn(&prims, 1);
+            }
+            let prims = std::mem::take(&mut me.nets[n].r.dynp);
+            me.stamp_dyn(&prims, -1);
+            me.nets[n].r = saved_n.0.clone();
+            me.nets[n].unconnected = saved_n.1.clone();
+            let prims = me.nets[n].r.dynp.clone();
+            me.stamp_dyn(&prims, 1);
+        };
+        // lift the vias out: remove each via and the last piece of the wires that end in it
+        let mut lifted: Vec<(usize, P, Vec<ViaStub>)> = vec![];
+        for &(_, m, v) in &near {
+            self.stamp_net(m, -1);
+            let mut stubs: Vec<ViaStub> = vec![];
+            let mut keep: Vec<Wire> = vec![];
+            for mut w in std::mem::take(&mut self.nets[m].r.wires) {
+                let k = w.pts.len();
+                if w.fill || k < 2 || (dist(w.pts[0], v) > 1e-6 && dist(w.pts[k - 1], v) > 1e-6) || dist(w.pts[0], w.pts[k - 1]) < 1e-6 {
+                    keep.push(w);
+                    continue;
+                }
+                if dist(w.pts[0], v) < 1e-6 {
+                    stubs.push(ViaStub { layer: w.layer, from: w.pts[1], width: w.width });
+                    w.pts.remove(0);
+                } else {
+                    stubs.push(ViaStub { layer: w.layer, from: w.pts[k - 2], width: w.width });
+                    w.pts.pop();
+                }
+                if w.pts.len() >= 2 {
+                    keep.push(w);
+                }
+            }
+            self.nets[m].r.wires = keep;
+            if let Some(i) = self.nets[m].r.vias.iter().position(|q| dist(*q, v) < 1e-6) {
+                self.nets[m].r.vias.remove(i);
+            }
+            self.rebuild_route_prims(m);
+            self.stamp_net(m, 1);
+            lifted.push((m, v, stubs));
+        }
+        // strategies 0 and 1: put the vias just clear of the straight line first, all on one side
+        if strategy <= 1 {
+            let side = if strategy == 0 { 1.0 } else { -1.0 };
+            let half = self.fields[self.nets[n].narrow_tf].p;
+            for (m, v, stubs) in &lifted {
+                let need = self.nets[*m].via_r + self.nets[*m].clr.max(self.nets[n].clr) + half + 0.02;
+                let ok = self.place_lifted_via(*m, *v, stubs, Some((a, b, need, side)))
+                    // none clears the line: leave it where it was, the router may go round
+                    || self.place_lifted_via(*m, *v, stubs, None);
+                if !ok {
+                    revert(self);
+                    return false;
+                }
+            }
+        }
+        // strategy 3: every via stays as a smaller ghost (a circle of `ghost` times its radius)
+        // while the net is routed, so the path keeps off its centre
+        let mut ghosts: Vec<Prim> = vec![];
+        if strategy == 3 {
+            for (m, v, _) in &lifted {
+                for l in 0..self.grid.nl {
+                    ghosts.push(Prim::new(l, Geo::Circle { c: *v, r: self.nets[*m].via_r * ghost }, *m as i32, self.nets[*m].clr));
+                }
+            }
+            self.stamp_dyn(&ghosts, 1);
+        }
+        // route the open net through the room; a corridor can be narrower than the grid can
+        // express, so the fine local search gets its turn too
+        self.rip_net(n);
+        self.route_net(n, false);
+        if !self.nets[n].unconnected.is_empty() {
+            self.adaptive_net(n);
+        }
+        if !ghosts.is_empty() {
+            self.stamp_dyn(&ghosts, -1);
+        }
+        if !self.nets[n].unconnected.is_empty() {
+            revert(self);
+            return false;
+        }
+        let prims = self.nets[n].r.dynp.clone();
+        if self.prims_conflict(&prims).is_some() {
+            revert(self);
+            return false;
+        }
+        // strategies 2 and 3: the vias go back as near as possible to where they were
+        if strategy >= 2 {
+            for (m, v, stubs) in &lifted {
+                if !self.place_lifted_via(*m, *v, stubs, None) {
+                    revert(self);
+                    return false;
+                }
+            }
+        }
+        // the owners of the moved vias must still be in as few pieces as before, and the open net
+        // must really be one piece now (the geometric check, not only the router's bookkeeping)
+        for &(m, before) in &pieces_before {
+            if crate::drc::net_islands(self, m).len() > before {
+                revert(self);
+                return false;
+            }
+        }
+        if crate::drc::net_islands(self, n).len() > 1 {
+            revert(self);
+            return false;
+        }
+        true
+    }
+
+    /// Move the vias `group` ((net, index in its via list)) by `off`, route net `n` again and
+    /// keep it all when `n` connects; otherwise everything is put back. Returns whether it stayed.
+    fn try_via_move(&mut self, n: usize, group: &[(usize, usize)], off: P) -> bool {
+        let mut moved_nets: Vec<usize> = group.iter().map(|g| g.0).collect();
+        moved_nets.sort_unstable();
+        moved_nets.dedup();
+        let saved: Vec<(usize, Routed)> = moved_nets.iter().map(|&m| (m, self.nets[m].r.clone())).collect();
+        let saved_n = (self.nets[n].r.clone(), self.nets[n].unconnected.clone());
+        let revert = |me: &mut Router, with_n: bool| {
+            if with_n {
+                let prims = std::mem::take(&mut me.nets[n].r.dynp);
+                me.stamp_dyn(&prims, -1);
+                me.nets[n].r = saved_n.0.clone();
+                me.nets[n].unconnected = saved_n.1.clone();
+                let prims = me.nets[n].r.dynp.clone();
+                me.stamp_dyn(&prims, 1);
+            }
+            for (m, r) in &saved {
+                let prims = std::mem::take(&mut me.nets[*m].r.dynp);
+                me.stamp_dyn(&prims, -1);
+                me.nets[*m].r = r.clone();
+                let prims = me.nets[*m].r.dynp.clone();
+                me.stamp_dyn(&prims, 1);
+            }
+        };
+        // move the vias and the wire ends in them
+        for &m in &moved_nets {
+            self.stamp_net(m, -1);
+            for &(gm, vi) in group.iter().filter(|g| g.0 == m) {
+                let old = saved.iter().find(|s| s.0 == gm).map(|s| s.1.vias[vi]).unwrap_or((0.0, 0.0));
+                let new = (old.0 + off.0, old.1 + off.1);
+                self.nets[m].r.vias[vi] = new;
+                for w in self.nets[m].r.wires.iter_mut().filter(|w| !w.fill) {
+                    for q in w.pts.iter_mut() {
+                        if dist(*q, old) < 1e-6 {
+                            *q = new;
+                        }
+                    }
+                }
+            }
+            self.rebuild_route_prims(m);
+            self.stamp_net(m, 1);
+        }
+        // exact check of everything that changed, and the new places must lie on the board
+        let mut ok = true;
+        for &m in &moved_nets {
+            for &(gm, vi) in group.iter().filter(|g| g.0 == m) {
+                if !point_in_poly(self.nets[gm].r.vias[vi], &self.boundary) {
+                    ok = false;
+                }
+            }
+            let prims = self.nets[m].r.dynp.clone();
+            if ok && self.prims_conflict(&prims).is_some() {
+                ok = false;
+            }
+        }
+        if !ok {
+            revert(self, false);
+            return false;
+        }
+        // route the open net again in the room that was made; a corridor between traces can be
+        // narrower than the grid can express, so the fine local search gets its turn too
+        self.rip_net(n);
+        self.route_net(n, false);
+        if !self.nets[n].unconnected.is_empty() {
+            self.adaptive_net(n);
+        }
+        let connected = self.nets[n].unconnected.is_empty();
+        let clean = connected && {
+            let prims = self.nets[n].r.dynp.clone();
+            self.prims_conflict(&prims).is_none()
+        };
+        if clean {
+            return true;
+        }
+        revert(self, true);
+        false
+    }
+
+    pub(crate) fn rebuild_route_prims(&mut self, n: usize) {
         let mut prims: Vec<Prim> = self.nets[n]
             .r
             .wires

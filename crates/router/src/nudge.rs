@@ -117,7 +117,7 @@ fn run_once(board: &Board, parts: &[PartSpec], cfg: &Config, skip: &[(String, St
         r.route_all();
         r.refine();
     }
-    let routes = if cfg.nudge_parts { r.save_routes() } else { vec![] };
+    let routes = r.save_routes();
     r.finish();
     let report = drc::check(&r);
     let fail = r.unrouted_count().max(report.open_nets.len());
@@ -125,8 +125,35 @@ fn run_once(board: &Board, parts: &[PartSpec], cfg: &Config, skip: &[(String, St
     Run { router: r, routes, report, fail, violations }
 }
 
+/// Where nudging stands over the whole run: the attempts and the time are spent once for all
+/// phases, the moves already tried are forgotten when a phase starts (the layout has changed).
+struct NudgeState {
+    tried: HashSet<(usize, i64, i64)>,
+    tried_parts: HashSet<usize>,
+    attempts: usize,
+    started: Option<std::time::Instant>,
+}
+
+impl NudgeState {
+    fn new() -> NudgeState {
+        NudgeState { tried: HashSet::new(), tried_parts: HashSet::new(), attempts: 0, started: None }
+    }
+}
+
+/// Longest time all nudging of one run may take.
+const NUDGE_SECONDS: u64 = 150;
+
+/// With only this many connections open the trouble is local: nudging is tried before the whole
+/// board is routed again.
+const LOCAL_OPEN: usize = 8;
+
 /// Route the board; with `cfg.nudge_parts` and connections left open, move small parts and try
 /// again, keeping every move that helps.
+///
+/// Connections that stay open are dealt with in this order: a few of them (`LOCAL_OPEN`) are
+/// first repaired locally (routed vias and small parts near them are moved a little, only what
+/// they touch is routed again), then the whole board is routed again on the fine grid and with
+/// narrow-first traces, then the parts are nudged for what is still open.
 pub fn solve(board: &Board, cfg: Config, parts: &[PartSpec], pour_skip: &[(String, String)]) -> Solved {
     let started = std::time::Instant::now();
     // Retries when connections stay open, each only when the one before left some open: the
@@ -147,17 +174,41 @@ pub fn solve(board: &Board, cfg: Config, parts: &[PartSpec], pour_skip: &[(Strin
     let mut best = run_once(board, parts, &first_cfg, pour_skip, &[], None);
     let mut moves: Vec<(usize, f64, f64)> = vec![];
     let mut log: Vec<String> = vec![];
+    let can_nudge = cfg.nudge_parts && !parts.is_empty() && board.components.len() == 1;
+    let mut st = NudgeState::new();
     let n_tries = tries.len();
     for (k, (fine, narrow)) in tries.into_iter().enumerate() {
         if best.fail == 0 || best.router.cancelled() {
             break;
         }
+        // only a few connections are open, so something small is stuck: repair it there before
+        // the whole board is routed again
+        if can_nudge && best.fail <= LOCAL_OPEN {
+            let spent = st.attempts;
+            nudge_phase(board, parts, &cfg, pour_skip, &mut best, &mut moves, &mut log, &mut st);
+            // one or two connections left after local repairs were really tried: routing everything
+            // again will not find them, it would only cost time
+            if best.fail <= 2 && st.attempts > spent {
+                break;
+            }
+        }
         let mut c2 = cfg.clone();
         c2.quick = k + 1 < n_tries;
         c2.fine_grid = fine;
         c2.narrow_first = narrow;
-        let alt = run_once(board, parts, &c2, pour_skip, &[], None);
-        if alt.fail < best.fail {
+        // First repair what is open on the finer grid or with narrow-first traces while every
+        // route that worked is kept (an arrangement that took effort to find, such as the escape
+        // of a fine-pitch IC, is not lost); only when that does not finish, route everything again.
+        // Parts moved so far stay where they are.
+        let mut alt = run_once(board, parts, &c2, pour_skip, &moves, Some(&best));
+        if alt.fail > 0 && !best.router.cancelled() {
+            let scratch = run_once(board, parts, &c2, pour_skip, &moves, None);
+            if scratch.fail < alt.fail {
+                alt = scratch;
+            }
+        }
+        // fewer open connections, without a clearly worse result in clearance
+        if alt.fail < best.fail && alt.violations <= best.violations + 10 {
             log.push(format!(
                 "{} connection(s) stayed open; {}{}routing completes {} more",
                 best.fail,
@@ -168,34 +219,67 @@ pub fn solve(board: &Board, cfg: Config, parts: &[PartSpec], pour_skip: &[(Strin
             best = alt;
         }
     }
-    if !cfg.nudge_parts || parts.is_empty() || board.components.len() != 1 {
-        return Solved { router: best.router, moves, log };
+    if can_nudge && best.fail > 0 {
+        nudge_phase(board, parts, &cfg, pour_skip, &mut best, &mut moves, &mut log, &mut st);
     }
-    let mut tried: HashSet<(usize, i64, i64)> = HashSet::new();
-    let mut tried_parts = HashSet::new();
-    let mut attempts = 0;
-    while best.fail > 0 && attempts < cfg.nudge_attempts && !best.router.cancelled() {
-        let cands = candidates(&best, board, parts, &cfg, &moves);
-        let mut available: Vec<_> = cands.into_iter().filter(|c| !tried.contains(&(c.part, (c.dx * 1000.0).round() as i64, (c.dy * 1000.0).round() as i64))).collect();
+    best.router.t0 = started;
+    Solved { router: best.router, moves, log }
+}
+
+/// Nudge small parts near the open connections of `best`, one move per attempt, keeping every
+/// move that leaves fewer connections open, until nothing is open or the attempts, the time or
+/// the candidates are used up.
+#[allow(clippy::too_many_arguments)]
+fn nudge_phase(
+    board: &Board,
+    parts: &[PartSpec],
+    cfg: &Config,
+    pour_skip: &[(String, String)],
+    best: &mut Run,
+    moves: &mut Vec<(usize, f64, f64)>,
+    log: &mut Vec<String>,
+    st: &mut NudgeState,
+) {
+    st.tried.clear();
+    st.tried_parts.clear();
+    st.started.get_or_insert_with(std::time::Instant::now);
+    // as many moves as asked for, but not for ever
+    while best.fail > 0
+        && st.attempts < cfg.nudge_attempts
+        && st.started.is_none_or(|t| t.elapsed().as_secs() < NUDGE_SECONDS)
+        && !best.router.cancelled()
+    {
+        let cands = candidates(best, board, parts, cfg, moves);
+        let mut available: Vec<_> = cands
+            .into_iter()
+            .filter(|c| !st.tried.contains(&(c.part, (c.dx * 1000.0).round() as i64, (c.dy * 1000.0).round() as i64)))
+            .collect();
         // Do not spend the entire attempt budget on several distant positions of
         // the same part while other parts along the blocked escape are untried.
-        let candidate = available.iter().position(|c| !tried_parts.contains(&c.part)).unwrap_or(0);
+        let candidate = available.iter().position(|c| !st.tried_parts.contains(&c.part)).unwrap_or(0);
         let c = if available.is_empty() {
             log.push("no further position to try for the parts around the open connections".into());
             best.router.snapshot("Nudging: no legal movable part near the remaining connections");
             break;
-        } else { available.remove(candidate) };
-        attempts += 1;
-        tried_parts.insert(c.part);
+        } else {
+            available.remove(candidate)
+        };
+        st.attempts += 1;
+        st.tried_parts.insert(c.part);
         let key = (c.part, (c.dx * 1000.0).round() as i64, (c.dy * 1000.0).round() as i64);
-        tried.insert(key);
-        let trial_moves = merge(&moves, c.part, c.dx, c.dy);
+        st.tried.insert(key);
+        let trial_moves = merge(moves, c.part, c.dx, c.dy);
         let unit = best.router.unit_mm;
-        let label = format!("Nudge {}/{}: {} by {:.2} mm", attempts, cfg.nudge_attempts,
-            parts[c.part].name, dist((0.0, 0.0), (c.dx, c.dy)) * unit);
+        let label = format!("Nudge {}/{}: {} by {:.2} mm", st.attempts, cfg.nudge_attempts, parts[c.part].name, dist((0.0, 0.0), (c.dx, c.dy)) * unit);
         best.router.snapshot(&label);
-        if cfg.verbose { eprintln!("{label}"); }
+        if cfg.verbose {
+            eprintln!("{label}");
+        }
         let mut trial_cfg = cfg.clone();
+        // the trial restores the routes of `best`: same grid, same width mode, full effort
+        trial_cfg.fine_grid = best.router.cfg.fine_grid;
+        trial_cfg.narrow_first = best.router.cfg.narrow_first;
+        trial_cfg.quick = false;
         if let Some(cb) = cfg.on_snapshot.clone() {
             trial_cfg.on_snapshot = Some(std::sync::Arc::new(move |mut snap| {
                 snap.label = format!("{label}: {}", snap.label);
@@ -203,11 +287,10 @@ pub fn solve(board: &Board, cfg: Config, parts: &[PartSpec], pour_skip: &[(Strin
             }));
         }
         if let Some(dir) = &cfg.snapshot_dir {
-            trial_cfg.snapshot_dir = Some(dir.join(format!("nudge-{attempts}")));
+            trial_cfg.snapshot_dir = Some(dir.join(format!("nudge-{}", st.attempts)));
         }
-        let run = run_once(board, parts, &trial_cfg, pour_skip, &trial_moves, Some(&best));
-        let better = run.violations <= best.violations
-            && (run.fail, run.violations) < (best.fail, best.violations);
+        let run = run_once(board, parts, &trial_cfg, pour_skip, &trial_moves, Some(&*best));
+        let better = run.violations <= best.violations && (run.fail, run.violations) < (best.fail, best.violations);
         let message = format!(
             "nudge {} by {:.2} mm: open {} -> {}, clearance errors {} -> {}{}",
             parts[c.part].name,
@@ -218,19 +301,19 @@ pub fn solve(board: &Board, cfg: Config, parts: &[PartSpec], pour_skip: &[(Strin
             run.violations,
             if better { "  (kept)" } else { "  (undone)" }
         );
-        if cfg.verbose { eprintln!("{message}"); }
+        if cfg.verbose {
+            eprintln!("{message}");
+        }
         log.push(message);
         if better {
-            best = run;
+            *best = run;
             best.router.cfg.on_snapshot = cfg.on_snapshot.clone();
             best.router.cfg.snapshot_dir = cfg.snapshot_dir.clone();
-            moves = trial_moves;
+            *moves = trial_moves;
         }
         // A rejected trial must not remain visible as if it were the chosen layout.
         best.router.snapshot(if better { "Nudge kept: improved routing" } else { "Nudge undone: restored best routing" });
     }
-    best.router.t0 = started;
-    Solved { router: best.router, moves, log }
 }
 
 struct Candidate {

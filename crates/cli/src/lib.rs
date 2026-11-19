@@ -35,6 +35,10 @@ fn usage() -> ! {
   --include-existing     DSN input: also write the existing wiring into the SES (an EasyEDA JSON /
                          Pro file always keeps what is on the board and adds the result to it)
   --allow-vias-in-pads   allow new vias to overlap pads (default off)
+  --tighten              after routing pull every trace tight: the shortest path around what is in
+                         the way, with 0/45/90 degree pieces
+  --tighten-free         the same at any angle (not only 45 degrees)
+  --no-suggest           do not test other settings when connections stay open
   --no-neckdown          never narrow a trace (default: a trace first keeps its full width and
                          goes around obstacles; only when that fails it is narrowed to 75%,
                          50%, then the minimum width, and widened again wherever room allows)
@@ -144,6 +148,9 @@ pub fn run() {
         let txt = std::fs::read_to_string(&args[i + 1]).expect("cannot read options file");
         cfg = serde_json::from_str(&txt).expect("bad options file");
         cfg.verbose = true;
+        // the grid is adaptive and the pair gap is the clearance: old option files may name them
+        cfg.grid = None;
+        cfg.pair_gap = None;
     }
     if let Some(i) = args.iter().position(|a| a == "--rules") {
         match router::DrcRules::preset(&args[i + 1]) {
@@ -162,6 +169,7 @@ pub fn run() {
     let mut out = None;
     let mut save_opts = None;
     let mut no_fills = false;
+    let mut no_suggest = false;
     let mut power_width_set = false;
     let mut i = 0;
     let kv = |s: &str| -> (String, f64) {
@@ -290,6 +298,9 @@ pub fn run() {
             "--pour-outlines" => cfg.pour_outlines = true,
             "--keep-track-widths" => cfg.keep_track_widths = true,
             "--no-fills" => no_fills = true,
+            "--no-suggest" => no_suggest = true,
+            "--tighten" => cfg.tighten = 1,
+            "--tighten-free" => cfg.tighten = 2,
             "--pour-reach-mm" => {
                 i += 1;
                 cfg.pour_reach_mm = args[i].parse().unwrap_or_else(|_| usage());
@@ -412,6 +423,7 @@ pub fn run() {
     cfg.validate(&board).expect("invalid routing options");
     let parts = doc.as_ref().map(router::nudge::specs_from_doc).unwrap_or_default();
     let skip: Vec<(String, String)> = doc.as_ref().map(|d| d.areas.iter().cloned().collect()).unwrap_or_default();
+    let base_cfg = cfg.clone();
     let solved = router::nudge::solve(&board, cfg, &parts, &skip);
     for l in &solved.log {
         println!("{l}");
@@ -507,6 +519,21 @@ pub fn run() {
     }
     for o in &report.open_nets {
         println!("  open: {}", o);
+    }
+    if (r.unrouted_count() > 0 || !report.open_nets.is_empty()) && !no_suggest {
+        let mut open_nets: Vec<String> = report.open_nets.iter().map(|o| o.split(" (").next().unwrap_or(o).to_string()).collect();
+        open_nets.extend(r.nets.iter().filter(|n| !n.unconnected.is_empty() && !n.skip).map(|n| n.name.clone()));
+        open_nets.sort();
+        open_nets.dedup();
+        let open_before = r.unrouted_count().max(report.open_nets.len());
+        println!("connections stay open: testing other settings ...");
+        let found = router::suggest::suggest(&board, &base_cfg, &parts, &skip, open_before, &open_nets, 4);
+        if found.is_empty() {
+            println!("no other setting that was tried routes more; try a different layer plan, wider spacing between parts or more layers");
+        }
+        for s in &found {
+            println!("suggestion: {}", s.text());
+        }
     }
     if !report.clearance_violations.is_empty() || !report.open_nets.is_empty() {
         log_diagnostic(&format!(

@@ -33,7 +33,7 @@ impl Router {
         }
     }
 
-    fn adaptive_net(&mut self, n: usize) {
+    pub(crate) fn adaptive_net(&mut self, n: usize) {
         let mut islands = drc::net_islands(self, n);
         if islands.len() == 1 {
             self.nets[n].unconnected.clear();
