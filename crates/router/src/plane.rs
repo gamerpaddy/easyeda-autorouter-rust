@@ -365,8 +365,15 @@ impl Router {
     /// Group each net's pins into electrically connected components (pads touching, existing
     /// wiring, vias, plane copper) and rasterise the cells of each group.
     pub(crate) fn init_components(&mut self) {
-        let nl = self.grid.nl;
         for n in 0..self.nets.len() {
+            self.init_net_components(n);
+        }
+    }
+
+    /// `init_components` for one net.
+    pub(crate) fn init_net_components(&mut self, n: usize) {
+        let nl = self.grid.nl;
+        {
             let pins = self.nets[n].pins.clone();
             let mut prims: Vec<Prim> = vec![];
             let mut owner: Vec<Option<usize>> = vec![];
@@ -473,7 +480,7 @@ impl Router {
                 let on_plane = |me: &Router, p: usize| {
                     me.pins[p].cells.iter().any(|&(cl, x, y)| {
                         cl == l && me.plane_id[l][y as usize * nx + x as usize] as usize == pi + 1
-                    })
+                    }) || me.drops.iter().any(|d| d.net == n && d.pin == p)
                 };
                 let mut merged: Vec<usize> = vec![];
                 let mut k = 0;
@@ -536,9 +543,15 @@ impl Router {
         let free = |c: usize| pid[c] == want && !tf.fx(l * nn + c) && !tf.dy(l * nn + c);
         let mut mask = vec![false; nn];
         let mut q: VecDeque<usize> = VecDeque::new();
-        if pl.synthetic && self.nets[n].comp_cells[0].is_empty() {
+        // no pad of the net touches the generated plane (its pads may be tied to it with vias): any
+        // free cell of the plane
+        if pl.synthetic && !self.nets[n].comp_cells[0].iter().any(|&(cl, _, _)| cl == l) {
+            // only the big connected pieces: a pocket that other copper has cut off from the rest
+            // of the plane is no place to land
+            let (label, sizes) = self.free_pieces(l, &free);
+            let biggest = sizes.iter().copied().max().unwrap_or(0);
             for c in 0..nn {
-                if free(c) {
+                if label[c] != 0 && sizes[label[c] as usize - 1] * 4 >= biggest {
                     mask[c] = true;
                 }
             }

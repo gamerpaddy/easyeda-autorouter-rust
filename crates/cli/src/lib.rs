@@ -34,7 +34,9 @@ fn usage() -> ! {
   --net-clearance NET=C  override a net's clearance (repeatable)
   --include-existing     DSN input: also write the existing wiring into the SES (an EasyEDA JSON /
                          Pro file always keeps what is on the board and adds the result to it)
-  --allow-vias-in-pads   allow new vias to overlap pads (default off)
+  --allow-vias-in-pads   allow new vias inside pads (default off)
+  --vias-at-pad-edge     allow new vias half over the edge of a pad (the centre stays outside the pad)
+                         and tie the pads of plane nets to their plane with such vias
   --tighten              after routing pull every trace tight: the shortest path around what is in
                          the way, with 0/45/90 degree pieces
   --tighten-free         the same at any angle (not only 45 degrees)
@@ -324,6 +326,7 @@ pub fn run() {
                 cfg.stitch_pitch_mm = args[i].parse().unwrap_or_else(|_| usage());
             }
             "--allow-vias-in-pads" => cfg.allow_vias_in_pads = true,
+            "--vias-at-pad-edge" => cfg.vias_at_pad_edge = true,
             "--no-neckdown" => cfg.allow_neckdown = false,
             "--single-sided" => cfg.single_sided = true,
             "--single-layer" => {

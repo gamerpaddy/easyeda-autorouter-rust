@@ -127,7 +127,10 @@ impl Router {
             }
         }
         if !self.cfg.allow_vias_in_pads {
-            for p in self.pins.iter().flat_map(|p| &p.prims) { fields[1].stamp(&grid, p, 1, false); }
+            let edge = self.cfg.vias_at_pad_edge;
+            for p in self.pins.iter().flat_map(|p| &p.prims) {
+                if edge { fields[1].stamp_t(&grid, p, 1, false, 1e-7); } else { fields[1].stamp(&grid, p, 1, false); }
+            }
         }
         // Preserve plane preferences on the local lattice, without changing the
         // exclusion of plane layers from signal routing.

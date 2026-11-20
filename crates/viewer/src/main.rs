@@ -1199,8 +1199,18 @@ impl App {
                     ui.checkbox(&mut self.cfg.jumpers, "0 ohm resistors as the last resort (0402 to 1206)")
                         .on_hover_text("A connection that has no path at all hops over the traces in its way with the smallest 0 ohm resistor that fits. The parts are in the saved EasyEDA JSON; a placement list (.jumpers.json) is written next to every result, for EasyEDA Pro projects the parts must be placed from it.");
                 });
-                ui.checkbox(&mut self.cfg.allow_vias_in_pads, "Allow vias inside pads")
-                    .on_hover_text("Off: a via never touches a pad. On: vias may sit inside pads, which can cost extra at the fabricator (plugged or filled vias).");
+                ui.horizontal(|ui| {
+                    ui.label("Vias on pads");
+                    let mut mode = if self.cfg.allow_vias_in_pads { 2 } else if self.cfg.vias_at_pad_edge { 1 } else { 0 };
+                    let before = mode;
+                    ui.selectable_value(&mut mode, 0, "never").on_hover_text("A via never touches a pad. Pads of a plane net get a via beside the pad, joined by a short trace.");
+                    ui.selectable_value(&mut mode, 1, "half over the edge").on_hover_text("A via may sit half over the edge of a pad of its own net (the centre of the via stays outside the pad). Usually no problem at the fabricator. Pads of a plane net get such a via right at the pad.");
+                    ui.selectable_value(&mut mode, 2, "inside the pad").on_hover_text("Vias may sit inside pads, which can cost extra at the fabricator (plugged or filled vias).");
+                    if mode != before {
+                        self.cfg.allow_vias_in_pads = mode == 2;
+                        self.cfg.vias_at_pad_edge = mode == 1;
+                    }
+                });
                 ui.checkbox(&mut self.cfg.allow_neckdown, "Narrow a trace where the full width does not fit")
                     .on_hover_text("Last option. A trace first keeps its full width and goes around obstacles; only when no acceptable path exists it is narrowed to 75%, 50%, then the minimum trace width (Design rules). The full width is restored wherever it fits.");
                 ui.horizontal(|ui| {

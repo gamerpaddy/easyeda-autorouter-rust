@@ -14,6 +14,8 @@ pub enum Change {
     /// A net leaves a plane layer: it is routed with traces (and may get a copper area on a
     /// signal layer) instead of sharing the plane layer.
     RemoveFromPlane { net: String, layer: String },
+    /// Vias may sit half over the edge of a pad.
+    ViasAtPadEdge,
     /// Vias may sit inside pads.
     AllowViasInPads,
     /// Replace the design rules by a preset (`DrcRules::preset`).
@@ -30,6 +32,7 @@ impl Change {
                     p.nets.retain(|n| n != net);
                 }
             }
+            Change::ViasAtPadEdge => cfg.vias_at_pad_edge = true,
             Change::AllowViasInPads => cfg.allow_vias_in_pads = true,
             Change::RulesPreset(name) => {
                 if let Some(r) = DrcRules::preset(name) {
@@ -45,7 +48,8 @@ impl Change {
             Change::RemoveFromPlane { net, layer } => {
                 format!("take {net} off the plane on layer {layer} (Layers: remove it from the plane's nets), it is then routed with traces")
             }
-            Change::AllowViasInPads => "tick 'Allow vias inside pads' (may cost extra at the fabricator)".to_string(),
+            Change::ViasAtPadEdge => "set 'Vias on pads' to 'half over the edge'".to_string(),
+            Change::AllowViasInPads => "set 'Vias on pads' to 'inside the pad' (may cost extra at the fabricator)".to_string(),
             Change::RulesPreset(name) => format!("use the '{name}' design rule preset"),
             Change::NudgeParts => "tick 'move small passives a little when connections stay open' (Last resorts)".to_string(),
         }
@@ -115,6 +119,9 @@ pub fn suggest(
     // then, ordered by what they cost the user: nudging small parts, vias inside pads, looser rules
     if !cfg.nudge_parts && !parts.is_empty() {
         candidates.push(vec![Change::NudgeParts]);
+    }
+    if !cfg.allow_vias_in_pads && !cfg.vias_at_pad_edge {
+        candidates.push(vec![Change::ViasAtPadEdge]);
     }
     if !cfg.allow_vias_in_pads {
         candidates.push(vec![Change::AllowViasInPads]);

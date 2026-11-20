@@ -169,6 +169,9 @@ pub struct Config {
     pub grid: Option<f64>,
     pub pairs: bool,
     pub allow_vias_in_pads: bool,
+    /// Vias may sit half over the edge of a pad of their own net (the centre of the via stays
+    /// outside the pad). Less than `allow_vias_in_pads`, which also allows the centre in the pad.
+    pub vias_at_pad_edge: bool,
     pub allow_neckdown: bool,
     pub add_gnd_planes: bool,
     pub protect_planes: bool,
@@ -279,6 +282,7 @@ impl Default for Config {
             grid: None,
             pairs: true,
             allow_vias_in_pads: false,
+            vias_at_pad_edge: false,
             allow_neckdown: true,
             add_gnd_planes: true,
             protect_planes: true,
@@ -381,6 +385,7 @@ impl Config {
         self.allow_plane_jumps = false;
         self.last_resort_pad_vias = false;
         self.allow_vias_in_pads = false;
+        self.vias_at_pad_edge = false;
         self.stitch_pitch_mm = 0.0;
         for ov in self.net_overrides.values_mut() {
             ov.via_count = None;
@@ -572,6 +577,9 @@ pub struct Field {
     pub p: f64,
     /// probe class for vias (ignores trace-only blockers such as exclusive planes)
     pub via: bool,
+    /// Routed copper keeps only this fraction of the clearance in this field (1 = all of it): a
+    /// "squeezed" probe that fits through places that are too crowded, to be shoved open afterwards.
+    pub dyn_k: f64,
     /// low 16 bits: fixed-copper stamp count, high 16 bits: routed (dynamic) copper count
     pub cnt: Vec<u32>,
     /// one byte per cell derived from `cnt` (bit 0 fixed, bit 1 routed): what searches read
@@ -587,6 +595,7 @@ impl Field {
             clr,
             p,
             via,
+            dyn_k: 1.0,
             cnt: vec![0; n],
             mask: vec![0; n],
             col: vec![0; if via { grid.n() } else { 0 }],
@@ -613,7 +622,12 @@ impl Field {
         if pr.trace_only && self.via {
             return;
         }
-        let t = self.threshold(pr);
+        let t = if dynamic { self.clr.max(pr.clr) * self.dyn_k + self.p + MARGIN } else { self.threshold(pr) };
+        self.stamp_t(g, pr, delta, dynamic, t);
+    }
+
+    /// Like `stamp`, with the reach `t` given: the cells whose centre is closer than `t` to `pr`.
+    pub(crate) fn stamp_t(&mut self, g: &Grid, pr: &Prim, delta: i32, dynamic: bool, t: f64) {
         let x0 = (((pr.bb.0 - t - g.x0) / g.g).floor() as i32).max(0);
         let x1 = (((pr.bb.2 + t - g.x0) / g.g).ceil() as i32).min(g.nx as i32 - 1);
         let y0 = (((pr.bb.1 - t - g.y0) / g.g).floor() as i32).max(0);
@@ -865,6 +879,8 @@ pub struct Router {
     pub escape: HashMap<Cell, (Vec<P>, usize)>,
     /// last-resort mode: the failing net may put vias inside its own pads
     pub pad_via_mode: bool,
+    /// vias that tie pads to the plane of their net, placed before routing
+    pub drops: Vec<crate::padvia::PlaneDrop>,
     /// A* heuristic weight (1 = exact shortest path; larger = faster, a little longer)
     pub h_weight: f32,
     /// layer changes that could not get all the vias requested for their net
@@ -1342,6 +1358,7 @@ impl Router {
             escape: HashMap::new(),
             jsizes,
             pad_via_mode: false,
+            drops: vec![],
             h_weight: h_weight(),
             via_shortfall: 0,
             jumps_used: 0,
@@ -1387,17 +1404,12 @@ impl Router {
                 f.stamp(&r.grid, pr, 1, false);
             }
         }
-        if !r.cfg.allow_vias_in_pads && !light {
-            // Independent fixed masks: own-net unstamping must not remove this restriction.
-            for pin in &r.pins {
-                for pr in &pin.prims {
-                    for f in r.fields.iter_mut().filter(|f| f.via) {
-                        f.stamp(&r.grid, pr, 1, false);
-                    }
-                }
-            }
-        }
         if !light {
+            // Independent fixed masks: own-net unstamping must not remove this restriction.
+            let all: Vec<usize> = (0..r.pins.len()).collect();
+            r.pad_via_mask(&all, 1);
+            // pads of plane nets get their via into the plane before anything is routed
+            r.place_plane_drops();
             r.add_escape_cells();
         }
         r.init_components();
@@ -2404,6 +2416,36 @@ impl Router {
     /// Route a single net. Returns list of victims ripped (they need rerouting).
     /// Pre-existing wiring and plane copper count as already connected groups of pins.
     pub fn route_net_plain(&mut self, n: usize, allow_rip: bool) -> Vec<usize> {
+        // A plane net takes every pad straight to its plane (a via next to the pad), not along the
+        // copper of its other pads: that would run a trace from pad to pad all over the board. Pads
+        // that find no way to the plane may still join the net's own copper.
+        // (only on a layer of its own: nets that share a plane layer may need each other's copper)
+        let planed = !self.nets[n].skip
+            && self.nets[n].comps.len() >= 2
+            && self.nets[n].plane.is_some_and(|pi| {
+                let l = self.planes[pi].layer;
+                self.planes[pi].synthetic && self.planes.iter().filter(|p| p.layer == l && p.synthetic && !p.filler).count() == 1
+            });
+        let mut ripped = self.route_net_plain_inner(n, allow_rip, !planed);
+        if planed && !self.nets[n].unconnected.is_empty() && !self.cancelled() {
+            let first = self.nets[n].unconnected.len();
+            let saved = (self.nets[n].r.clone(), self.nets[n].unconnected.clone());
+            self.rip_net(n);
+            ripped.extend(self.route_net_plain_inner(n, allow_rip, true));
+            if self.nets[n].unconnected.len() > first {
+                // not better: keep the first result
+                let prims = std::mem::take(&mut self.nets[n].r.dynp);
+                self.stamp_dyn(&prims, -1);
+                self.nets[n].r = saved.0;
+                self.nets[n].unconnected = saved.1;
+                let prims = self.nets[n].r.dynp.clone();
+                self.stamp_dyn(&prims, 1);
+            }
+        }
+        ripped
+    }
+
+    fn route_net_plain_inner(&mut self, n: usize, allow_rip: bool, plane_tree: bool) -> Vec<usize> {
         let mut ripped: Vec<usize> = vec![];
         if self.nets[n].skip || self.nets[n].comps.len() < 2 {
             return ripped;
@@ -2482,7 +2524,7 @@ impl Router {
                     (bx1 + m).min(nx - 1),
                     (by1 + m).min(ny - 1),
                 );
-                let mut tg = tree.clone();
+                let mut tg = if plane_tree { tree.clone() } else { vec![] };
                 tg.extend(self.landing_cells(*ll, mask, w));
                 seeds = comp_cells.clone();
                 targets = tg;
@@ -2508,7 +2550,7 @@ impl Router {
             // full-board targets (plane mode needs the whole plane as target set)
             let targets_full: Vec<Cell> = match &landing {
                 Some((ll, mask)) => {
-                    let mut tg = tree.clone();
+                    let mut tg = if plane_tree { tree.clone() } else { vec![] };
                     tg.extend(self.landing_cells(*ll, mask, full));
                     tg
                 }
@@ -2686,17 +2728,11 @@ impl Router {
         let old = (self.nets[n].r.clone(), self.nets[n].unconnected.clone());
         let (c, gd) = (self.nets[n].coupled, self.nets[n].guided);
         let (used_j, used_p) = (self.jumps_used, self.pad_vias_used);
-        let grid = self.grid.clone();
         // lift the "no vias in pads" mask for this net's own pads only
         let lift = padvia && !self.cfg.allow_vias_in_pads;
+        let own_pins = self.nets[n].pins.clone();
         if lift {
-            for &pi in &self.nets[n].pins {
-                for pr in &self.pins[pi].prims {
-                    for f in self.fields.iter_mut().filter(|f| f.via) {
-                        f.stamp(&grid, pr, -1, false);
-                    }
-                }
-            }
+            self.pad_via_mask(&own_pins, -1);
         }
         self.jump_mode = jump;
         self.pad_via_mode = lift;
@@ -2704,13 +2740,7 @@ impl Router {
         self.jump_mode = false;
         self.pad_via_mode = false;
         if lift {
-            for &pi in &self.nets[n].pins {
-                for pr in &self.pins[pi].prims {
-                    for f in self.fields.iter_mut().filter(|f| f.via) {
-                        f.stamp(&grid, pr, 1, false);
-                    }
-                }
-            }
+            self.pad_via_mask(&own_pins, 1);
         }
         if self.cfg.verbose {
             eprintln!(
@@ -3418,6 +3448,7 @@ impl Router {
         self.restore_routes(best);
         self.last_resorts();
         self.adaptive_repair();
+        self.revalidate_drops();
         self.plane_repair();
         self.snapshot("initial routing done");
         if self.cfg.verbose {
@@ -3510,6 +3541,7 @@ impl Router {
         self.regional_rescue();
         self.last_resorts();
         self.adaptive_repair();
+        self.revalidate_drops();
         self.plane_repair();
     }
 
@@ -3911,6 +3943,7 @@ impl Router {
             escape: if same_grid { self.escape.clone() } else { HashMap::new() },
             jsizes: self.jsizes.clone(),
             pad_via_mode: self.pad_via_mode,
+            drops: self.drops.clone(),
             h_weight: self.h_weight,
             via_shortfall: 0,
             jumps_used: 0,

@@ -904,3 +904,79 @@ fn full_width_detour_is_preferred_over_narrowing() {
     assert_eq!(r.unrouted_count(), 0);
     assert!(r.nets[0].r.wires.iter().all(|w| (w.width - 1.0).abs() < 1e-9), "all pieces keep the full width");
 }
+
+// ---- vias that tie the pads of a plane net to its plane ----
+
+fn plane_board() -> dsn::Board {
+    dsn::parse_dsn(
+        r#"(pcb planetest (resolution mm 1000)
+      (structure (boundary (path pcb 0 0 0 30 0 30 20 0 20))
+       (layer top (type signal)) (layer inner (type signal)) (layer bottom (type signal))
+       (grid wire 0.1) (via via0) (rule (width 0.25) (clearance 0.2)))
+      (placement (component img (place U 0 0 front 0)))
+      (library (image img (pin pad 1 5 5) (pin pad 2 25 5) (pin pad 3 5 15) (pin pad 4 25 15)
+                           (pin pad 5 15 5) (pin pad 6 15 15))
+       (padstack pad (shape (circle top 1.2)))
+       (padstack via0 (shape (circle top 0.6)) (shape (circle inner 0.6)) (shape (circle bottom 0.6))))
+      (network (net GND (pins U-1 U-2 U-3 U-4)) (net DATA (pins U-5 U-6))))"#,
+    )
+    .unwrap()
+}
+
+fn plane_run(mode: u8, skip: bool) -> Router {
+    let b = plane_board();
+    let mut cfg = Config { verbose: false, ..Config::default() };
+    cfg.layers.insert(
+        "inner".into(),
+        router::LayerPlan { role: router::LayerRole::Plane, nets: vec!["GND".into()] },
+    );
+    cfg.allow_vias_in_pads = mode == 2;
+    cfg.vias_at_pad_edge = mode == 1;
+    if skip {
+        cfg.net_overrides.insert("GND".into(), router::NetOverride { skip: true, ..Default::default() });
+    }
+    let mut r = Router::new(&b, cfg);
+    r.route_all();
+    r.refine();
+    r.finish();
+    r
+}
+
+#[test]
+fn plane_pads_get_a_via_instead_of_traces() {
+    for (mode, skip) in [(0u8, false), (1, false), (2, false), (0, true), (1, true), (2, true)] {
+        let r = plane_run(mode, skip);
+        let gnd = r.nets.iter().position(|n| n.name == "GND").unwrap();
+        // vias beside a pad (mode 0) are only placed for a net that is not routed
+        let expect = if mode == 0 && !skip { 0 } else { 4 };
+        assert_eq!(r.drops.len(), expect, "mode {mode} skip {skip}: every GND pad gets a via");
+        assert_eq!(r.unrouted_count(), 0);
+        let g = &r.nets[gnd];
+        assert_eq!(g.r.vias.len(), 4, "mode {mode} skip {skip}");
+        for d in &r.drops {
+            let pad = &r.pins[d.pin].prims[0];
+            let dist = pad.dist(d.via);
+            let vr = g.via_r;
+            match mode {
+                2 => assert!(dist <= 1e-9, "via inside the pad"),
+                1 => assert!(dist > 0.0 && dist < vr, "via half over the pad edge: {dist}"),
+                _ => assert!(dist >= vr, "via beside the pad: {dist}"),
+            }
+            assert_eq!(d.stub.is_some(), mode == 0);
+        }
+        // no trace except the short stubs of the vias beside a pad
+        let traces = g.r.wires.iter().filter(|w| !w.fill).count();
+        if mode == 0 && !skip {
+            // the router takes each pad to the plane with a via beside it: no trace from pad to pad
+            let longest = g.r.wires.iter().filter(|w| !w.fill).map(|w| w.pts.windows(2).map(|s| router::geom::dist(s[0], s[1])).sum::<f64>()).fold(0.0, f64::max);
+            assert!(longest < 3.0, "a trace of {longest} mm on a plane net");
+        } else {
+            assert_eq!(traces, if mode == 0 { 4 } else { 0 }, "mode {mode} skip {skip}");
+        }
+        let rep = drc::check(&r);
+        assert!(rep.clearance_violations.is_empty(), "mode {mode}: {:?}", rep.clearance_violations);
+        if !skip {
+            assert!(rep.open_nets.is_empty(), "mode {mode}: {:?}", rep.open_nets);
+        }
+    }
+}

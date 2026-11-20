@@ -88,6 +88,7 @@ impl Router {
 
     pub fn finish(&mut self) {
         if self.cancelled() {
+            self.merge_drops();
             return;
         }
         let _t = std::time::Instant::now();
@@ -174,6 +175,29 @@ impl Router {
                 let p = crate::pair::simplify(&w.pts);
                 if p.len() >= 2 {
                     w.pts = p;
+                }
+            }
+        }
+        // the vias that tie pads to their plane go into the result
+        self.merge_drops();
+        if std::env::var_os("AR_DEBUG_ISL").is_some() {
+            for n in 0..self.nets.len() {
+                if self.nets[n].skip || self.nets[n].pins.len() < 2 {
+                    continue;
+                }
+                let isl = crate::drc::net_islands(self, n);
+                if isl.len() > 1 {
+                    for (k, i) in isl.iter().enumerate() {
+                        for &p in i.pins.iter().take(6) {
+                            let c = self.pins[p].c;
+                            let drop = self.drops.iter().find(|d| d.pin == p).map(|d| d.via);
+                            eprintln!(
+                                "ISL {} island {} pin {} at ({:.2},{:.2}) mm drop {:?} ({} pins, {} prims)",
+                                self.nets[n].name, k, self.pins[p].name, c.0 * self.unit_mm, c.1 * self.unit_mm,
+                                drop.map(|d| (d.0 * self.unit_mm, d.1 * self.unit_mm)), i.pins.len(), i.prims.len()
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -2254,7 +2278,12 @@ impl Router {
                 return true;
             }
         }
-        self.push_vias_try(n, 0, 0.0) || self.push_vias_try(n, 1, 0.0) || self.push_vias_try(n, 2, 0.0)
+        if self.push_vias_try(n, 0, 0.0) || self.push_vias_try(n, 1, 0.0) || self.push_vias_try(n, 2, 0.0) {
+            return true;
+        }
+        // 4. push and shove: the net squeezes through, the vias and traces around it are pushed
+        //    aside, which pushes their neighbours in turn
+        self.shove_route(n)
     }
 
     /// Put a lifted via of net `m` (and the wire pieces `stubs` that end in it) at the nearest

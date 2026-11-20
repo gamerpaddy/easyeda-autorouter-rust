@@ -568,14 +568,18 @@ impl Router {
             )
         };
         for a in newp {
-            if !self.cfg.allow_vias_in_pads && matches!(a.geo, Geo::Circle { .. }) {
-                for pin in &self.pins {
-                    if pin
-                        .prims
-                        .iter()
-                        .any(|o| o.layer == a.layer && a.gap(o) < 0.0)
-                    {
-                        return Some("via overlaps pad".into());
+            if !self.cfg.allow_vias_in_pads {
+                if let Geo::Circle { c, .. } = a.geo {
+                    // half over the edge of a pad is allowed in that mode: only the centre counts
+                    let edge = self.cfg.vias_at_pad_edge;
+                    for pin in &self.pins {
+                        if pin
+                            .prims
+                            .iter()
+                            .any(|o| o.layer == a.layer && if edge { o.dist(c) <= 1e-9 } else { a.gap(o) < 0.0 })
+                        {
+                            return Some("via overlaps pad".into());
+                        }
                     }
                 }
             }
