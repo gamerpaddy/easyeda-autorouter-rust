@@ -597,6 +597,7 @@ name = "cli"
 version = "0.1.0"
 dependencies = [
  "dsn",
+ "place",
  "router",
  "serde_json",
 ]
@@ -2521,6 +2522,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
+name = "place"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "serde_json",
+ "zip",
+]
+
+[[package]]
 name = "plain"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3507,6 +3517,7 @@ dependencies = [
  "cli",
  "dsn",
  "eframe",
+ "place",
  "rfd",
  "router",
  "serde",

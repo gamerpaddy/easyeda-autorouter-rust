@@ -8,6 +8,7 @@ path = "src/main.rs"
 [dependencies]
 dsn = { path = "../dsn" }
 router = { path = "../router" }
+place = { path = "../place" }
 
 [dependencies.serde_json]
 version = "1"

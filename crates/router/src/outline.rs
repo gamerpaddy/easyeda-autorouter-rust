@@ -90,6 +90,53 @@ fn merge_holes(outer: Vec<P>, holes: Vec<Vec<P>>) -> Vec<P> {
     merge_holes_checked(outer, holes).0
 }
 
+/// Cells of two labels that meet only at a corner (a 2x2 window with one label on each diagonal)
+/// make a ring that touches itself there. One cell of such a window is changed so that one of the
+/// labels is connected through an edge; never a cell in `keep`, and a label only goes where `ok`.
+pub(crate) fn fix_pinches(lab: &mut [u8], nx: usize, ny: usize, keep: &[bool], ok: &[bool]) {
+    for _ in 0..6 {
+        let mut changed = false;
+        for y in 0..ny.saturating_sub(1) {
+            for x in 0..nx.saturating_sub(1) {
+                let (ia, ib, ic, id) = (y * nx + x, y * nx + x + 1, (y + 1) * nx + x, (y + 1) * nx + x + 1);
+                let (a, b, c, d) = (lab[ia], lab[ib], lab[ic], lab[id]);
+                if a != d || b != c || a == b {
+                    continue;
+                }
+                let opts = [(ib, a), (ic, a), (ia, b), (id, b)];
+                if let Some(&(i, l)) = opts.iter().find(|&&(i, l)| !keep[i] && (l == u8::MAX || ok[i])) {
+                    lab[i] = l;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+#[cfg(test)]
+mod pinch_tests {
+    use super::fix_pinches;
+
+    #[test]
+    fn diagonal_contact_becomes_an_edge_contact() {
+        // 2x2: A B / B A
+        let mut lab = vec![1u8, 2, 2, 1];
+        fix_pinches(&mut lab, 2, 2, &[false; 4], &[true; 4]);
+        assert!(!(lab[0] == lab[3] && lab[1] == lab[2] && lab[0] != lab[1]), "{lab:?}");
+        // a cell that carries a via is left alone, another one changes
+        let mut lab = vec![1u8, 2, 2, 1];
+        fix_pinches(&mut lab, 2, 2, &[false, true, false, false], &[true; 4]);
+        assert_eq!(lab[1], 2);
+        // nothing changes where no copper is allowed
+        let mut lab = vec![1u8, 2, 2, 1];
+        fix_pinches(&mut lab, 2, 2, &[false; 4], &[false; 4]);
+        assert_eq!(lab, vec![1, 2, 2, 1]);
+    }
+}
+
 /// Like `merge_holes`; the count is the number of holes that could not be joined (those are
 /// left out of the polygon, so the caller must not use it as copper).
 pub(crate) fn merge_holes_checked(mut outer: Vec<P>, mut holes: Vec<Vec<P>>) -> (Vec<P>, usize) {

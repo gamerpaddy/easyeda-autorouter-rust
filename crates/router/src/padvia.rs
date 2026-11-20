@@ -117,9 +117,21 @@ impl Router {
         }
         kinds_all.push(DropKind::Beside);
         for n in 0..self.nets.len() {
-            let Some(pi) = self.planes.iter().position(|p| p.net == n && p.synthetic && !p.filler) else {
-                continue;
+            let plane = self.planes.iter().position(|p| p.net == n && p.synthetic && !p.filler);
+            // A power net that is not routed and has copper areas on signal layers (Layers): its
+            // pads need a via to reach those areas.
+            let pour_layers: Vec<usize> = if plane.is_none() && self.nets[n].power && self.nets[n].skip && self.cfg.pour_polygons {
+                (0..self.grid.nl)
+                    .filter(|&ly| {
+                        self.cfg.layers.get(&self.layer_names[ly]).is_some_and(|p| p.role != LayerRole::Plane && p.nets.contains(&self.nets[n].name))
+                    })
+                    .collect()
+            } else {
+                vec![]
             };
+            if plane.is_none() && pour_layers.is_empty() {
+                continue;
+            }
             // vias beside a pad (never touching it) are for nets that are not routed; the router
             // places those of the others itself, after the signals
             if !self.cfg.allow_vias_in_pads && !self.cfg.vias_at_pad_edge && !self.nets[n].skip {
@@ -130,18 +142,20 @@ impl Router {
             if self.cfg.net_overrides.get(&self.nets[n].name).and_then(|o| o.via_count).is_some_and(|c| c > 1) {
                 continue;
             }
-            let l = self.planes[pi].layer;
             let (via_r, clr) = (self.nets[n].via_r, self.nets[n].clr);
             let narrow = (self.fields[self.nets[n].narrow_tf].p * 2.0).min(self.nets[n].width);
             let widths: Vec<f64> = if self.nets[n].width - narrow > 1e-9 { vec![self.nets[n].width, narrow] } else { vec![narrow] };
             let pins = self.nets[n].pins.clone();
             for pin in pins {
-                if self.pin_on_plane(pin, pi) {
+                if plane.is_some_and(|pi| self.pin_on_plane(pin, pi)) {
                     continue;
                 }
                 let prs: Vec<Prim> = self.pins[pin].prims.clone();
                 let Some(first) = prs.first() else { continue };
                 let lp = first.layer;
+                if plane.is_none() && pour_layers.contains(&lp) {
+                    continue;
+                }
                 // through-hole pads (several layers) are left to the router
                 if prs.iter().any(|p| p.layer != lp) {
                     continue;
@@ -221,9 +235,12 @@ impl Router {
                         }
                         // the via must land in this net's plane
                         stat.0 += 1;
-                        if self.plane_id[l][cy as usize * self.grid.nx + cx as usize] as usize != pi + 1 {
-                            stat.1 += 1;
-                            continue;
+                        if let Some(pi) = plane {
+                            let l = self.planes[pi].layer;
+                            if self.plane_id[l][cy as usize * self.grid.nx + cx as usize] as usize != pi + 1 {
+                                stat.1 += 1;
+                                continue;
+                            }
                         }
                         let vias: Vec<Prim> = (0..self.grid.nl)
                             .map(|ly| Prim::new(ly, Geo::Circle { c: cand.pos, r: via_r }, n as i32, clr))

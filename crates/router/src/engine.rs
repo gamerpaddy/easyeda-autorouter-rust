@@ -22,6 +22,26 @@ fn full_h_weight() -> f32 {
 /// Extra via cost (fraction of a via) per pad whose escape room the via would take.
 const CROWD_VIA: f32 = 0.3;
 
+/// Does the name look like a supply or ground net: +5V, -12V, +3V3, 3.3V, GND, AGND, VCC, VDD,
+/// VSS, VEE, VBUS, VBAT ... (the default of a net's "power" setting).
+pub fn is_power_name(name: &str) -> bool {
+    let n = name.trim().to_uppercase();
+    let b = n.as_bytes();
+    if b.len() >= 2 && (b[0] == b'+' || b[0] == b'-') && b[1].is_ascii_digit() {
+        return true;
+    }
+    // 5V, 3V3, 1V8, 3.3V, 12V
+    if let Some(v) = n.find('V') {
+        let (a, rest) = (&n[..v], &n[v + 1..]);
+        if !a.is_empty() && a.chars().all(|c| c.is_ascii_digit() || c == '.') && rest.chars().all(|c| c.is_ascii_digit()) {
+            return true;
+        }
+    }
+    ["GND", "AGND", "DGND", "PGND", "VCC", "VDD", "VSS", "VEE", "VBUS", "VBAT", "AVDD", "DVDD", "AVCC", "DVCC", "AVSS", "DVSS"]
+        .iter()
+        .any(|p| n.starts_with(p))
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NetOverride {
@@ -30,6 +50,9 @@ pub struct NetOverride {
     pub clearance: Option<f64>,
     /// leave this net unrouted
     pub skip: bool,
+    /// Power net (supply or ground): None = by its name (`is_power_name`). A power net gets copper
+    /// areas and vias for them also when it is not routed.
+    pub power: Option<bool>,
     /// via padstack to use for this net (one of the DSN's via names)
     pub via: Option<String>,
     /// vias placed side by side at every layer change (power nets); None/1 = single via
@@ -799,6 +822,8 @@ pub struct NetState {
     pub comps: Vec<Vec<usize>>,
     pub comp_cells: Vec<Vec<Cell>>,
     pub skip: bool,
+    /// supply or ground net: takes part in copper areas and gets their vias even when not routed
+    pub power: bool,
     /// index into Router::planes when this net owns a plane its pins are merged into
     pub plane: Option<usize>,
     pub plane_mul: f32,
@@ -1090,6 +1115,7 @@ impl Router {
                 comps: vec![],
                 comp_cells: vec![],
                 skip: cfg.net_overrides.get(&n.name).map_or(false, |o| o.skip),
+                power: cfg.net_overrides.get(&n.name).and_then(|o| o.power).unwrap_or_else(|| is_power_name(&n.name)),
                 plane: None,
                 plane_mul: 1.0,
             });

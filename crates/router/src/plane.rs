@@ -180,7 +180,7 @@ impl Router {
         let gnd = self
             .nets
             .iter()
-            .position(|n| n.name.eq_ignore_ascii_case("GND") && !n.skip && !n.pins.is_empty());
+            .position(|n| n.name.eq_ignore_ascii_case("GND") && (!n.skip || n.power) && !n.pins.is_empty());
         let mut order: Vec<(usize, Vec<usize>)> = vec![];
         for (l, layer) in board.layers.iter().enumerate() {
             let Some(plan) = self.cfg.layers.get(&layer.name) else {

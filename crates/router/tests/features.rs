@@ -980,3 +980,54 @@ fn plane_pads_get_a_via_instead_of_traces() {
         }
     }
 }
+
+#[test]
+fn power_names_are_recognised() {
+    for n in ["GND", "AGND", "+5V", "-12V", "+3V3", "3V3", "5V", "3.3V", "VCC", "VDD_IO", "VSS", "VEE", "VBUS"] {
+        assert!(router::is_power_name(n), "{n}");
+    }
+    for n in ["DATA", "CLK", "SDA", "V", "VOUT_SENSE_X", "LED1", "RESET"] {
+        assert!(!router::is_power_name(n), "{n}");
+    }
+}
+
+/// A power net that is not routed still gets its copper area and its vias; a net that is not a
+/// power net and not routed does not.
+#[test]
+fn unrouted_power_nets_take_part_in_the_copper_areas() {
+    let src = r#"(pcb pw (resolution mm 1000)
+      (structure (boundary (path pcb 0 0 0 40 0 40 30 0 30))
+       (layer top (type signal)) (layer bottom (type signal))
+       (grid wire 0.1) (via via0) (rule (width 0.25) (clearance 0.2)))
+      (placement (component img (place U 0 0 front 0)))
+      (library (image img (pin smd 1 10 10) (pin smd 2 14 10) (pin smd 3 18 10) (pin smd 4 22 10)
+                           (pin smd 5 10 25) (pin smd 6 30 25))
+       (padstack smd (shape (circle top 1.2)))
+       (padstack via0 (shape (circle top 0.6)) (shape (circle bottom 0.6))))
+      (network (net GND (pins U-1 U-3 U-5)) (net OTHER (pins U-2 U-4 U-6))))"#;
+    for (other_power, expect_other) in [(false, false), (true, true)] {
+        let b = dsn::parse_dsn(src).unwrap();
+        let mut cfg = Config { verbose: false, pour_polygons: true, ..Config::default() };
+        cfg.layers.insert("bottom".into(), router::LayerPlan { role: router::LayerRole::Plane, nets: vec!["GND".into(), "OTHER".into()] });
+        cfg.use_trace_routing();
+        cfg.vias_at_pad_edge = true;
+        for n in ["GND", "OTHER"] {
+            cfg.net_overrides.insert(n.into(), router::NetOverride { skip: true, power: Some(n == "GND" || other_power), ..Default::default() });
+        }
+        let mut r = Router::new(&b, cfg);
+        r.route_all();
+        r.refine();
+        r.finish();
+        let bottom = r.layer_names.iter().position(|n| n == "bottom").unwrap();
+        let has = |name: &str| {
+            let i = r.nets.iter().position(|n| n.name == name).unwrap();
+            let vias = r.drops.iter().filter(|d| d.net == i).count();
+            (r.fill_polys.iter().any(|p| p.0 == i && p.1 == bottom), vias)
+        };
+        let (gnd_area, gnd_vias) = has("GND");
+        assert!(gnd_area, "the unrouted power net GND has a copper area");
+        assert_eq!(gnd_vias, 3, "one plane via per GND pad");
+        let (area, _) = has("OTHER");
+        assert_eq!(area, expect_other, "other_power {other_power}");
+    }
+}

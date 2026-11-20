@@ -11,6 +11,7 @@ path = "src/main.rs"
 cli = { path = "../cli" }
 dsn = { path = "../dsn" }
 router = { path = "../router" }
+place = { path = "../place" }
 serde_json = "1"
 eframe = "0.37"
 serde = { version = "1", features = ["derive"] }

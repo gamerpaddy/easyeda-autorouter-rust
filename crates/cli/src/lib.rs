@@ -24,12 +24,24 @@ fn usage() -> ! {
   --nudge-widths X       how far such a part may move from its place, in part sizes (default 3, max 3)
   --nudge-attempts N     how many moved layouts are routed at most (default 6)
 
+  --place                EasyEDA input: place the parts first (optional; parts that are locked in the
+                         file stay). The placed board is routed; --save-placed FILE also writes it
+  --place-sides S        front (default) | back | both
+  --place-effort N       1..10 (default 3)      --place-seed N
+  --place-clearance MM   gap between parts (default 0.25)      --place-edge MM   distance to the edge
+  --place-no-rotate      keep the orientations     --place-size S  noroom | tight | normal | relaxed
+                         (only without a board outline)
+  --save-placed FILE     write the placed board (with --place)
+
   --options FILE         load options from a JSON file (the GUI writes the same format)
   --save-options FILE    write the effective options to a JSON file and continue
   --exclusive L1,L2      layers on which no traces are routed
   --exclusive-plane N@L  plane (NET@LAYER) in which no traces are routed (repeatable)
   --plane-penalty X      extra cost factor for cutting a foreign plane (default 3)
   --skip NET1,NET2       leave these nets unrouted
+  --power NET1,NET2      mark nets as power nets (default: +5V, -12V, 3V3, GND, VCC, VDD, VSS, VEE ...):
+                         they take part in the copper areas and get their vias even when not routed
+  --not-power NET1,NET2  the opposite
   --net-width NET=W      override a net's trace width (repeatable)
   --net-clearance NET=C  override a net's clearance (repeatable)
   --include-existing     DSN input: also write the existing wiring into the SES (an EasyEDA JSON /
@@ -112,6 +124,8 @@ pub fn run() {
             "--exclusive-plane",
             "--plane-penalty",
             "--skip",
+            "--power",
+            "--not-power",
             "--net-width",
             "--net-clearance",
             "--snapshots",
@@ -137,6 +151,13 @@ pub fn run() {
             "--single-layer",
             "--jumper-sizes",
             "--max-detour",
+            "--place-sides",
+            "--place-effort",
+            "--place-seed",
+            "--place-clearance",
+            "--place-edge",
+            "--place-size",
+            "--save-placed",
         ]
         .contains(&a.as_str())
             && i + 1 == args.len()
@@ -170,6 +191,9 @@ pub fn run() {
     let mut input = None;
     let mut out = None;
     let mut save_opts = None;
+    let mut place_on = false;
+    let mut pset = place::engine::Settings::default();
+    let mut save_placed: Option<PathBuf> = None;
     let mut no_fills = false;
     let mut no_suggest = false;
     let mut power_width_set = false;
@@ -200,6 +224,13 @@ pub fn run() {
             "--plane-penalty" => {
                 i += 1;
                 cfg.plane_penalty = args[i].parse().unwrap_or_else(|_| usage());
+            }
+            "--power" | "--not-power" => {
+                let on = args[i] == "--power";
+                i += 1;
+                for n in args[i].split(',') {
+                    cfg.net_overrides.entry(n.to_string()).or_insert_with(NetOverride::default).power = Some(on);
+                }
             }
             "--skip" => {
                 i += 1;
@@ -366,6 +397,47 @@ pub fn run() {
                 cfg.grid = Some(args[i].parse().unwrap());
             }
             "--no-pairs" => cfg.pairs = false,
+            "--place" => place_on = true,
+            "--place-sides" => {
+                i += 1;
+                pset.sides = match args[i].as_str() {
+                    "front" => place::engine::Sides::Front,
+                    "back" => place::engine::Sides::Back,
+                    "both" => place::engine::Sides::Both,
+                    _ => usage(),
+                };
+            }
+            "--place-size" => {
+                i += 1;
+                pset.size = match args[i].as_str() {
+                    "noroom" => place::engine::Size::NoRoom,
+                    "tight" => place::engine::Size::Tight,
+                    "normal" => place::engine::Size::Normal,
+                    "relaxed" => place::engine::Size::Relaxed,
+                    _ => usage(),
+                };
+            }
+            "--place-effort" => {
+                i += 1;
+                pset.effort = args[i].parse().unwrap_or_else(|_| usage());
+            }
+            "--place-seed" => {
+                i += 1;
+                pset.seed = args[i].parse().unwrap_or_else(|_| usage());
+            }
+            "--place-clearance" => {
+                i += 1;
+                pset.clearance = args[i].parse().unwrap_or_else(|_| usage());
+            }
+            "--place-edge" => {
+                i += 1;
+                pset.edge_margin = args[i].parse().unwrap_or_else(|_| usage());
+            }
+            "--place-no-rotate" => pset.allow_rotate = false,
+            "--save-placed" => {
+                i += 1;
+                save_placed = Some(PathBuf::from(&args[i]));
+            }
             "--quiet" => cfg.verbose = false,
             s if !s.starts_with('-') => input = Some(PathBuf::from(s)),
             _ => usage(),
@@ -401,7 +473,17 @@ pub fn run() {
         }
     });
     // an .epro2 / .epro is a ZIP archive, everything else is text
-    let raw = std::fs::read(&input).expect("cannot read input file");
+    let mut raw = std::fs::read(&input).expect("cannot read input file");
+    if place_on {
+        if !is_json {
+            eprintln!("--place needs an EasyEDA Standard / Pro file");
+            std::process::exit(2);
+        }
+        raw = place_board(&raw, &pset, save_placed.as_deref()).unwrap_or_else(|e| {
+            eprintln!("placement failed: {e}");
+            std::process::exit(2)
+        });
+    }
     let src = if is_pro { String::new() } else { String::from_utf8(raw.clone()).expect("input file is not valid UTF-8") };
     let doc = if is_json {
         let d = (if is_pro { dsn::easyeda_pro::load(&raw) } else { dsn::easyeda::load(&src) }).unwrap_or_else(|e| {
@@ -619,6 +701,30 @@ pub fn run() {
         );
     }
     println!("wrote {}", out.display());
+}
+
+/// Optional step before routing: place the parts of an EasyEDA board. Returns the placed file.
+fn place_board(raw: &[u8], s: &place::engine::Settings, save: Option<&std::path::Path>) -> Result<Vec<u8>, String> {
+    let (doc, board) = place::load(raw)?;
+    let o = place::engine::place(&board, s, &mut |_, _, _| true)?;
+    let errs = place::engine::verify(&board, s, &o);
+    println!(
+        "placement: wire length {:.0} -> {:.0} mm, used area {:.1} x {:.1} mm{}",
+        o.hpwl_before,
+        o.hpwl_after,
+        o.used[2] - o.used[0],
+        o.used[3] - o.used[1],
+        if errs.is_empty() { String::new() } else { format!(", CHECK FAILED ({} problems)", errs.len()) }
+    );
+    for n in &o.notes {
+        println!("note: {n}");
+    }
+    let data = doc.save(&board, &o.pl, true, None)?;
+    if let Some(f) = save {
+        std::fs::write(f, &data).map_err(|e| format!("{}: {e}", f.display()))?;
+        println!("placed board written to {}", f.display());
+    }
+    Ok(data)
 }
 
 fn log_diagnostic(message: &str) {

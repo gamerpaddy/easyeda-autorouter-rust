@@ -360,7 +360,7 @@ impl Router {
                 .map(|p| {
                     p.nets
                         .iter()
-                        .filter_map(|nm| self.nets.iter().position(|n| &n.name == nm && !n.skip))
+                        .filter_map(|nm| self.nets.iter().position(|n| &n.name == nm && (!n.skip || n.power)))
                         .filter(|&n| {
                             !self.pour_skip.iter().any(|(a, b)| *a == self.nets[n].name && *b == self.layer_names[l])
                         })
@@ -474,7 +474,7 @@ impl Router {
         }
         self.nets
             .iter()
-            .position(|n| n.name.eq_ignore_ascii_case(self.cfg.fill_net.trim()) && !n.skip && !n.pins.is_empty())
+            .position(|n| n.name.eq_ignore_ascii_case(self.cfg.fill_net.trim()) && (!n.skip || n.power) && !n.pins.is_empty())
     }
 
     /// Does the fill net get a generated area on layer `l`? Not where it is assigned to the
@@ -534,7 +534,7 @@ impl Router {
                 .map(|p| {
                     p.nets
                         .iter()
-                        .filter_map(|nm| self.nets.iter().position(|n| &n.name == nm && !n.skip))
+                        .filter_map(|nm| self.nets.iter().position(|n| &n.name == nm && (!n.skip || n.power)))
                         .filter(|&n| !self.pour_skip.iter().any(|(a, b)| *a == self.nets[n].name && *b == self.layer_names[l]))
                         .take(250)
                         .collect()
@@ -1143,6 +1143,15 @@ impl Router {
                     // a piece that carries vias or pads of its plane is never dropped; fill areas
                     // need no copper of their own yet (stitching vias or pruning decide later)
                     let fill_piece = fill_net == Some(n) && self.fill_applies(l, n);
+                    if std::env::var_os("AR_DEBUG_POUR").is_some() {
+                        let (sx, sy) = (piece[0] % cnx, piece[0] / cnx);
+                        eprintln!(
+                            "pour piece {} layer {}: {} blocks ({:.1} mm2) at block ({},{}) keep {} must {} fill_piece {} min {:.1}",
+                            self.nets[n].name, self.layer_names[l], piece.len(),
+                            piece.len() as f64 * block_area * self.unit_mm * self.unit_mm, sx, sy, keep, must, fill_piece,
+                            min_area * self.unit_mm * self.unit_mm
+                        );
+                    }
                     if !must && ((!keep && !fill_piece) || piece.len() as f64 * block_area < min_area) {
                         for i in piece {
                             mask[i] = false;
@@ -1200,6 +1209,11 @@ impl Router {
                     }
                 }
             }
+            // Two areas (or an area and a gap) that meet only at a corner leave a ring that touches
+            // itself there: an invalid polygon that CADs fill wrongly. A 2x2 window with the same
+            // label on one diagonal and another on the other gets one cell changed, never one
+            // under a via or pad.
+            crate::outline::fix_pinches(&mut lab, nx, ny, &is_foot, &board_ok);
             let chains = crate::outline::trace_chains(&lab, nx, ny);
             let to_pt = |&(x, y): &(i32, i32)| -> P { (g.x0 + (x as f64 - 0.5) * g.g, g.y0 + (y as f64 - 0.5) * g.g) };
             // The simplification tolerance is coarse (a staircase of one block per step becomes one
@@ -3196,11 +3210,11 @@ impl Router {
         let gnd = self
             .nets
             .iter()
-            .position(|n| n.name.eq_ignore_ascii_case("GND") && !n.skip);
+            .position(|n| n.name.eq_ignore_ascii_case("GND") && (!n.skip || n.power));
         let mut jobs: Vec<(usize, usize, Option<usize>)> = vec![]; // (layer, net, plane)
         for l in 0..nl {
             for (pi, pl) in self.planes.iter().enumerate() {
-                if pl.layer == l && pl.synthetic && !self.nets[pl.net].skip {
+                if pl.layer == l && pl.synthetic && (!self.nets[pl.net].skip || self.nets[pl.net].power) {
                     jobs.push((l, pl.net, Some(pi)));
                 }
             }
@@ -3224,7 +3238,7 @@ impl Router {
                 pours.extend(gnd);
             }
             for n in pours {
-                if self.nets[n].skip
+                if (self.nets[n].skip && !self.nets[n].power)
                     || self
                         .planes
                         .iter()

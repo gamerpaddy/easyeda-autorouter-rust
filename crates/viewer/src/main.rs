@@ -15,6 +15,14 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
+mod placement;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Route,
+    Place,
+}
+
 const LAYER_COLORS: [(u8, u8, u8); 8] = [
     (220, 60, 60),
     (60, 160, 230),
@@ -285,6 +293,10 @@ fn triangulate(pts: &[(f64, f64)]) -> Vec<[usize; 3]> {
 
 struct App {
     path: String,
+    /// the bytes of the loaded file (what the placement tab works on)
+    raw: Vec<u8>,
+    mode: Mode,
+    plc: placement::PlaceState,
     /// the EasyEDA source document the board was loaded from, if any
     easyeda: Option<Arc<dsn::easyeda::EasyedaDoc>>,
     // Immutable board geometry is shared by the UI and routing worker.
@@ -418,6 +430,9 @@ impl App {
             focus_since: 0.0,
             canvas_rect: egui::Rect::NOTHING,
             path: st.last_path.clone(),
+            raw: vec![],
+            mode: Mode::Route,
+            plc: placement::PlaceState::new(),
             board: None,
             easyeda: None,
             preview: None,
@@ -458,9 +473,6 @@ impl App {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| path.to_string());
         let path = abs.as_str();
-        // loading or reloading a board removes the crosshair of the previous one
-        self.focus = None;
-        let is_pro = path.to_lowercase().ends_with(".epro2") || path.to_lowercase().ends_with(".epro");
         let raw = match std::fs::read(path) {
             Ok(b) => b,
             Err(e) => {
@@ -469,6 +481,50 @@ impl App {
                 return;
             }
         };
+        self.load_raw(path, raw);
+    }
+
+    /// Take over the placement made in the placement tab: the router loads the board again with
+    /// the parts where they are now, keeping all its settings. Earlier results are dropped.
+    fn adopt_placement(&mut self, bytes: Vec<u8>) {
+        let keep = (
+            self.cfg.net_overrides.clone(),
+            self.cfg.group_tolerances.clone(),
+            self.cfg.layers.clone(),
+            self.cfg.exclusive.clone(),
+            self.cfg.exclusive_planes.clone(),
+            self.cfg.unit_mm,
+        );
+        let path = self.path.clone();
+        if self.load_raw(&path, bytes) {
+            self.cfg.net_overrides = keep.0;
+            self.cfg.group_tolerances = keep.1;
+            self.cfg.layers = keep.2;
+            self.cfg.exclusive = keep.3;
+            self.cfg.exclusive_planes = keep.4;
+            self.cfg.unit_mm = keep.5;
+            self.refresh_preview();
+            self.mode = Mode::Route;
+            self.msg = "Placement taken over: the parts are where you put them. Press Route.".into();
+        }
+    }
+
+    /// Names of the nets that stayed open in the last routing run.
+    fn open_net_names(&self) -> Vec<String> {
+        let (Some(b), Some(s)) = (&self.board, self.snaps.last()) else { return vec![] };
+        if self.result.is_none() {
+            return vec![];
+        }
+        let mut v: Vec<String> = s.unrouted.iter().filter_map(|(n, _)| b.nets.get(*n).map(|n| n.name.clone())).collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    fn load_raw(&mut self, path: &str, raw: Vec<u8>) -> bool {
+        // loading or reloading a board removes the crosshair of the previous one
+        self.focus = None;
+        let is_pro = path.to_lowercase().ends_with(".epro2") || path.to_lowercase().ends_with(".epro");
         // an .epro2 / .epro is a ZIP archive, everything else is text
         let src = if is_pro {
             String::new()
@@ -478,7 +534,7 @@ impl App {
                 Err(e) => {
                     self.msg = format!("cannot read {}: {}", path, e);
                     log_error(&self.msg);
-                    return;
+                    return false;
                 }
             }
         };
@@ -494,7 +550,7 @@ impl App {
                 Err(e) => {
                     self.msg = format!("EasyEDA file error: {}", e);
                     log_error(&self.msg);
-                    return;
+                    return false;
                 }
             }
         } else {
@@ -505,7 +561,7 @@ impl App {
             Err(e) => {
                 self.msg = format!("DSN error: {}", e);
                 log_error(&self.msg);
-                return;
+                return false;
             }
         };
         let (pads, pos) = pads_of(&board);
@@ -577,7 +633,7 @@ impl App {
         if let Err(e) = self.cfg.validate(&board) {
             log_error(&e);
             self.msg = e;
-            return;
+            return false;
         }
         let light = Router::new_with(
             &board,
@@ -612,6 +668,11 @@ impl App {
             }
         }
         self.board = Some(Arc::new(board));
+        self.raw = raw;
+        let raw_ref = std::mem::take(&mut self.raw);
+        self.plc.set_source(&raw_ref, path);
+        self.raw = raw_ref;
+        true
     }
 
     /// Rebuild the pre-route analysis after layer roles, units or rules changed.
@@ -686,6 +747,7 @@ impl App {
     }
 
     fn start(&mut self) {
+        self.mode = Mode::Route;
         self.cfg.use_trace_routing();
         let Some(board) = self.board.clone() else {
             return;
@@ -1466,6 +1528,7 @@ impl App {
                 egui::Grid::new("nets").striped(true).show(ui, |ui| {
                     ui.label("pick").on_hover_text("Tick two or more nets to route them together as a group (see the buttons above).");
                     ui.label("route").on_hover_text("Untick to leave this net unrouted.");
+                    ui.label("power").on_hover_text("Supply or ground net (preset by the name: +5V, -12V, 3V3, GND, VCC, VDD, VSS, VEE ...). A power net takes part in the copper areas and the ground fill and gets a via at its pads for them, also when it is not routed.");
                     ui.label("net");
                     ui.label("open").on_hover_text("Connections of this net that are still unrouted (a tick = complete).");
                     ui.label(format!("width ({})", ul)).on_hover_text("Trace width for this net. Empty: the default of the file.");
@@ -1493,6 +1556,10 @@ impl App {
                         let mut route = !ov.skip;
                         if ui.checkbox(&mut route, "").changed() {
                             ov.skip = !route;
+                        }
+                        let mut power = ov.power.unwrap_or_else(|| router::is_power_name(&n.name));
+                        if ui.checkbox(&mut power, "").changed() {
+                            ov.power = Some(power);
                         }
                         let sel = self.sel_net == Some(i);
                         let grouped = !ov.diff_group.trim().is_empty() && ov.diff_group.trim() != "-";
@@ -1548,7 +1615,7 @@ impl App {
                 });
                 if ui.button("Save options file").clicked() {
                     let mut c = self.cfg.clone();
-                    c.net_overrides.retain(|_, o| o.skip || o.width.is_some() || o.clearance.is_some() || !o.diff_group.is_empty());
+                    c.net_overrides.retain(|_, o| o.skip || o.power.is_some() || o.width.is_some() || o.clearance.is_some() || !o.diff_group.is_empty());
                     self.msg = match std::fs::write(&self.options_path, serde_json::to_string_pretty(&c).unwrap()) {
                         Ok(_) => format!("saved {}", self.options_path),
                         Err(e) => e.to_string(),
@@ -2003,6 +2070,11 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll();
+        self.plc.poll();
+        self.plc.save_cfg();
+        if self.plc.running() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(60));
+        }
         if self.dirty_preview && !self.running {
             self.refresh_preview();
         }
@@ -2067,6 +2139,9 @@ impl eframe::App for App {
                     let p = self.path.clone();
                     self.load(&p);
                 }
+                ui.separator();
+                ui.selectable_value(&mut self.mode, Mode::Route, "Routing").on_hover_text("Routing options, preview and result");
+                ui.selectable_value(&mut self.mode, Mode::Place, "Placement").on_hover_text("Optional automatic placement, and moving parts by hand (also when connections stayed open after routing)");
                 ui.separator();
                 let can_run = self.board.is_some() && !self.running;
                 if ui
@@ -2170,9 +2245,21 @@ impl eframe::App for App {
         egui::Panel::left("opts")
             .default_size(340.0)
             .show(ui, |ui| {
-                self.side_panel(ui);
+                if self.mode == Mode::Place {
+                    let open = self.open_net_names();
+                    let mut take = None;
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        take = self.plc.side_panel(ui, &open);
+                    });
+                    if let Some(bytes) = take {
+                        self.adopt_placement(bytes);
+                    }
+                } else {
+                    self.side_panel(ui);
+                }
             });
 
+        if self.mode == Mode::Route {
         egui::Panel::bottom("timeline")
             .resizable(true)
             .default_size(240.0)
@@ -2308,9 +2395,15 @@ impl eframe::App for App {
                 }
             }
         });
+        }
 
         egui::CentralPanel::default().show(ui, |ui| {
-            self.canvas(ui);
+            if self.mode == Mode::Place {
+                let open = self.open_net_names();
+                self.plc.canvas(ui, &open);
+            } else {
+                self.canvas(ui);
+            }
         });
     }
 }
