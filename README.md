@@ -1,4 +1,4 @@
-# EasyEDA Autorouter
+# EasyEDA Autorouter & Autoplacer
 
 An autorouter with an optional autoplacer for EasyEDA projects (Standard and Pro), written in Rust. It can place the parts, lets you move parts by hand, routes all open connections with real track widths and vias, generates copper areas and writes a new project file that you open in EasyEDA again.
 
@@ -62,6 +62,7 @@ Works on EasyEDA Standard `.json` and Pro `.epro2` files (not on a plain DSN).
 Next to a 0.35 mm pitch QFN the clearance leaves a trace only a very narrow band along the centre line of a pad. When no cell of the routing grid lies in that band, the pad would have no cell a trace can start from and would never be routed although the way out is free. Such a pad gets escape cells just outside it, and a route that starts or ends there is completed with a short stub that runs along the centre line of the pad first (checked with the exact geometry). On the ESP32-S31 test board this took 6 unrouted pads (STRAP_IO36, RMII_CRS_DV, ETH_MDIO and two +3V3 pins among them) down to 3 before any part was moved.
 
 The airwires of the open connections join every cut-off piece of a net to the nearest piece that is connected (not to the first pin of the net), so a net with several open pieces shows all of its missing links. While hundreds of connections are still open, the early snapshots show the simple lines.
+<img width="1502" height="952" alt="autorouter_owLBorq9Aq" src="https://github.com/user-attachments/assets/b13781be-706b-42f8-be0a-aaa4c588a2ab" />
 
 ## When connections stay open
 
@@ -72,6 +73,7 @@ The router then tests other settings on the board and reports only the ones that
 ![Copper areas of the same board, one colour per net](docs/adau1452-copper-areas.png)
 
 Areas are written as outlines with horizontal, vertical and 45 degree edges; a diagonal edge is one straight line, only near a via or pad that needs it the outline follows the grid more closely. EasyEDA cuts the clearances itself when you rebuild them (Ctrl+B).
+<img width="859" height="894" alt="grafik" src="https://github.com/user-attachments/assets/c438c6f6-b639-433b-ae94-bd04d041564f" />
 
 ## Speed
 
