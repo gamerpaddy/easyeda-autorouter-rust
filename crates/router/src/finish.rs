@@ -1238,6 +1238,12 @@ impl Router {
                     % 2
                     == 1
             };
+            // A via or pad that lies where the net has no area (a piece that was dropped) cannot be
+            // covered by moving the boundary: it must not make the boundary there finer and finer.
+            let in_area = |k: usize, p: P| -> bool {
+                let (cx, cy) = g.cell(p);
+                cx >= 0 && cy >= 0 && (cx as usize) < nx && (cy as usize) < ny && lab[cy as usize * nx + cx as usize] == k as u8
+            };
             let mut rings: Vec<Vec<Vec<(i32, i32)>>> = vec![];
             for _round in 0..60 {
                 let mut simp: Vec<Vec<(i32, i32)>> = vec![vec![]; chains.len()];
@@ -1265,6 +1271,12 @@ impl Router {
                 for k in 0..kn {
                     let polys: Vec<Vec<P>> = rings[k].iter().map(|r| r.iter().map(to_pt).collect()).collect();
                     for &p in &check[k] {
+                        if !in_area(k, p) {
+                            if std::env::var_os("AR_DEBUG_POUR").is_some() && _round == 0 {
+                                eprintln!("pour: {} layer {}: a via/pad at ({:.1},{:.1}) is outside its area, not refined for", self.nets[group[k].0].name, self.layer_names[l], p.0, p.1);
+                            }
+                            continue;
+                        }
                         let inside = polys.iter().filter(|poly| point_in_poly(p, poly)).count() % 2 == 1;
                         if inside {
                             continue;
@@ -1298,7 +1310,7 @@ impl Router {
             }
             for k in 0..kn {
                 let n = group[k].0;
-                let uncovered = check[k].iter().filter(|&&p| !covered(&rings, k, p)).count();
+                let uncovered = check[k].iter().filter(|&&p| in_area(k, p) && !covered(&rings, k, p)).count();
                 if uncovered > 0 {
                     self.pour_warnings.push(format!(
                         "{} on layer {}: {} point(s) of its vias/pads are not covered by the copper area",
