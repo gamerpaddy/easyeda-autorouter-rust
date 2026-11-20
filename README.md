@@ -1,6 +1,6 @@
 # EasyEDA Autorouter
 
-An autorouter for EasyEDA Standard projects, written in Rust. It reads the project, routes all open connections with real track widths and vias, generates copper areas and writes a new project file that you open in EasyEDA again.
+An autorouter with an optional autoplacer for EasyEDA projects (Standard and Pro), written in Rust. It can place the parts, lets you move parts by hand, routes all open connections with real track widths and vias, generates copper areas and writes a new project file that you open in EasyEDA again.
 
 ![ADAU1452 board, routed in 25 seconds](docs/adau1452-routed.png)
 
@@ -40,7 +40,22 @@ Notes for Pro projects:
 - Differential pairs and length matching, several vias per layer change for power nets (never overlapping, falls back to fewer if there is no room).
 - Last resorts for connections that stay open: short jumps on plane layers, a via inside a pad, and nudging small passives a little (off by default).
 - Independent DRC and connectivity check of the result before you save it.
+- Optional autoplacer and manual part moving in the same program, also when connections stay open after routing (see Placement).
 - Windows GUI with live preview, plus a command line mode.
+
+## Placement (optional)
+
+![Placement tab: parts placed automatically, the open nets of the last routing in red](docs/placement.png)
+
+The autoplacer is part of the program, nothing is placed unless you ask for it. Open a board, switch from **Routing** to **Placement** at the top of the window, and either let the program place the parts or move them yourself, or both.
+
+- **Automatic placement** (*Place parts*): a constructive placement followed by simulated annealing on the weighted wire length, with hard rules: every part stays inside the board outline (without an outline you pick a size: no room to breathe, tight, normal, relaxed, or a fixed size), parts never overlap, and chips with many pins get extra room between each other. Decoupling capacitors are paired with the chip pin they serve and placed right at it. Parts that are locked in the file, and parts you locked or moved by hand, are never moved. Parts go to the front only (default), the back only, or both sides (Pro files).
+- **Manual placement:** click a part, drag it, `R` / `Shift+R` turn it, `F` puts it on the other side, `L` locks or unlocks it, *Reset* puts it back. A part you move or turn locks itself, so a later automatic placement works around it. The ratsnest shows what is connected to what, with net names on the pins when you zoom in.
+- **When routing leaves connections open:** the nets that stayed open are drawn in red in the Placement tab. Move the parts that are in the way, press *Use this placement for routing* and then *Route* again. Net settings, layer plan and rules are kept, earlier results are dropped.
+- **Saving:** *Save placed board* writes `<name>-placed.json` / `.epro2`. By default the tracks and vias that are already in the file are removed (they no longer fit the moved parts); untick *Remove existing tracks/vias of the file* to keep them.
+- **Command line:** `--place` places the board before routing, with `--place-sides front|back|both`, `--place-effort 1..10`, `--place-seed N`, `--place-clearance MM`, `--place-edge MM`, `--place-size noroom|tight|normal|relaxed`, `--place-no-rotate`, and `--save-placed FILE` to keep the placed board. `autoplacer-cli board.epro2 [options] [--svg after.svg]` places without routing.
+
+Works on EasyEDA Standard `.json` and Pro `.epro2` files (not on a plain DSN).
 
 ## Fine-pitch pads
 
@@ -84,8 +99,6 @@ Independent nets and repair trials run in parallel on the CPU. The router sizes 
 1. In EasyEDA, place the parts, draw the board outline and set the design rules (track width, clearance, via size). Net specific widths can be set there or later in the autorouter.
 2. **File > Export > EasyEDA source** and save the `.json` file.
 3. Start `autorouter.exe` and open the file.
-**Placement (optional).** The former autoplacer is part of this program. The **Placement** tab (next to **Routing** at the top) places the parts automatically (sides, gap, board size, decoupling caps at the chip pins) and lets you move parts by hand: click a part, drag it, `R` / `Shift+R` turn, `F` flip, `L` lock. Nothing is placed unless you press *Place parts*. Moving parts by hand also works after routing: the nets that stayed open are drawn in red, move the parts in the way, press *Use this placement for routing*, then *Route* again. *Save placed board* writes the placed file. On the command line `--place` (with `--place-sides`, `--place-effort`, `--place-seed`, `--place-clearance`, `--place-edge`, `--place-size`, `--place-no-rotate`, `--save-placed FILE`) places the board before routing; `autoplacer-cli` is still built for placement alone. Works on EasyEDA Standard and Pro files.
-
 4. In **Layers**, choose which nets belong on which layer. For a ground plane put GND on an inner layer and set the layer type to plane. Power rails can share a plane layer, they split the room between them. Every SMD pad of a plane net gets its via into the plane before anything is routed (inside the pad, half over its edge or beside it with a short stub, as far as *Vias on pads* allows), so those pads need no traces. This also holds for a net set to *no route*: its plane pads still get their vias.
 5. In **Nets**, set width, clearance and vias per layer change for power nets, or untick nets you want to route yourself.
 6. Adjust the options below if needed and press **Route**. The report at the end lists clearance errors and open nets.
